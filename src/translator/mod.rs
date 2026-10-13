@@ -289,7 +289,7 @@ impl Translator {
             t.turn = None;
             t.starting = false;
         }
-        let queued: Vec<Value> = st.queued.drain(..).collect();
+        let queued: Vec<Value> = std::mem::take(&mut st.queued);
         for m in queued {
             if let Some(id) = m.get("id").filter(|_| m.get("method").is_some()) {
                 out.push(Out::Client(err(id, INTERNAL, &message)));
