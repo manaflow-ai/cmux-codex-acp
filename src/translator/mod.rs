@@ -91,6 +91,8 @@ enum Pending {
 /// request.
 #[derive(Debug, Clone)]
 struct Asked {
+    /// The thread (ACP session) it was asked in.
+    thread: String,
     /// The app-server request this answers.
     server_id: Value,
     /// ACP option id -> the decision value sent back.
@@ -120,6 +122,11 @@ struct Thread {
     /// The parent thread when this is a subagent.
     parent: Option<String>,
     mode: String,
+    /// The mode the app-server applies now (set at thread start and on each
+    /// turn that changed it): a turn sends approval and sandbox overrides
+    /// only when `mode` differs, so the user's own sandbox settings (extra
+    /// writable roots, network) stay in force otherwise.
+    applied_mode: String,
     model: String,
     effort: String,
     /// The running turn.
@@ -130,13 +137,16 @@ struct Thread {
     starting: bool,
     /// A cancel arrived before the turn had an id.
     cancel_pending: bool,
+    /// Steers that arrived before the turn had an id: (ACP request, input).
+    queued_steers: Vec<(Value, Vec<Value>)>,
     /// Agent message and reasoning items that streamed deltas.
     streamed: HashSet<String>,
     /// Running tool items -> their `tool_call` fields at start (a file
     /// change's diffs are computed once, from the file before the change).
     tools: HashMap<String, Value>,
-    /// Running command items -> output so far.
-    output: HashMap<String, String>,
+    /// Running command items -> their output tail and how much of it the
+    /// client got in content so far.
+    output: HashMap<String, (String, usize)>,
     /// Token totals at the running turn's start, and the latest.
     usage_at_start: Option<Value>,
     usage: Option<Value>,
@@ -273,6 +283,9 @@ impl Translator {
             if let Some(id) = t.prompt.take() {
                 out.push(Out::Client(err(&id, INTERNAL, &message)));
             }
+            for (id, _) in t.queued_steers.drain(..) {
+                out.push(Out::Client(err(&id, INTERNAL, &message)));
+            }
             t.turn = None;
             t.starting = false;
         }
@@ -345,6 +358,24 @@ impl State {
         r
     }
 
+    /// `thread` and every subagent under it, at any depth.
+    fn family(&self, thread: &str) -> Vec<String> {
+        let mut all = vec![thread.to_owned()];
+        let mut i = 0;
+        while i < all.len() {
+            let parent = all[i].clone();
+            all.extend(
+                self.threads
+                    .iter()
+                    .filter(|(id, t)| t.parent.as_deref() == Some(parent.as_str()) && !all.contains(id))
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>(),
+            );
+            i += 1;
+        }
+        all
+    }
+
     /// Root sessions (not subagents).
     fn roots(&self) -> Vec<String> {
         self.threads.iter().filter(|(_, t)| t.parent.is_none()).map(|(id, _)| id.clone()).collect()
@@ -364,6 +395,7 @@ impl State {
             .unwrap_or_else(|| config::DEFAULT_EFFORT.into());
         let t = self.threads.entry(id.clone()).or_default();
         t.parent = None;
+        t.applied_mode = mode.clone();
         t.mode = mode;
         t.model = model;
         t.effort = effort;

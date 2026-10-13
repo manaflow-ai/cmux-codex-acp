@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::time::Duration;
 
-const TURN: Duration = Duration::from_secs(300);
+const TURN: Duration = Duration::from_secs(480);
 
 struct Live {
     argv: Vec<String>,

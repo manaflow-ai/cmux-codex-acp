@@ -9,6 +9,9 @@
 /// leaves (context and added), at its 1-based old start line.
 struct Hunk {
     old_start: usize,
+    old_count: usize,
+    new_start: usize,
+    new_count: usize,
     old: Vec<String>,
     new: Vec<String>,
     /// The old (or new) side ends without a newline at end of file.
@@ -22,22 +25,34 @@ fn parse(diff: &str) -> Vec<Hunk> {
     // The side the previous body line belonged to, for "\ No newline".
     let mut last: char = ' ';
     for line in diff.strip_suffix('\n').unwrap_or(diff).split('\n') {
-        if let Some(rest) = line.strip_prefix("@@ ") {
+        let header = if line == "@@" { Some("") } else { line.strip_prefix("@@ ") };
+        if let Some(rest) = header {
             if let Some(h) = current.take() {
                 hunks.push(h);
             }
-            let old_start = rest
-                .strip_prefix('-')
-                .and_then(|r| r.split([',', ' ']).next())
-                .and_then(|n| n.parse::<usize>().ok())
-                .unwrap_or(1);
-            current = Some(Hunk { old_start, old: Vec::new(), new: Vec::new(), old_no_eol: false, new_no_eol: false });
+            // "-a[,b] +c[,d] @@": a count is 1 when it is left out.
+            let range = |sign: char| -> (usize, usize) {
+                let part = rest.split(' ').find_map(|w| w.strip_prefix(sign)).unwrap_or("1");
+                let mut it = part.split(',');
+                let start = it.next().and_then(|n| n.parse().ok()).unwrap_or(1);
+                let count = it.next().and_then(|n| n.parse().ok()).unwrap_or(1);
+                (start, count)
+            };
+            let ((old_start, old_count), (new_start, new_count)) = (range('-'), range('+'));
+            current = Some(Hunk {
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+                old: Vec::new(),
+                new: Vec::new(),
+                old_no_eol: false,
+                new_no_eol: false,
+            });
             continue;
         }
+        // File headers ("--- a", "+++ b") come before the first hunk only.
         let Some(h) = current.as_mut() else { continue };
-        if line.starts_with("--- ") || line.starts_with("+++ ") {
-            continue;
-        }
         if line.starts_with('\\') {
             match last {
                 '-' => h.old_no_eol = true,
@@ -101,7 +116,9 @@ fn apply_hunks(text: &str, hunks: &[Hunk], forward: bool) -> Option<String> {
         } else {
             (&h.new, &h.old, h.new_no_eol, h.old_no_eol)
         };
-        let hint = h.old_start.saturating_sub(1);
+        // A range of length 0 names the line after which the hunk goes.
+        let (start, count) = if forward { (h.old_start, h.old_count) } else { (h.new_start, h.new_count) };
+        let hint = if count == 0 { start } else { start.saturating_sub(1) };
         let pos = find(&src, want, at, hint)?;
         out.extend_from_slice(&src[at..pos]);
         out.extend(put.iter().cloned());
@@ -140,6 +157,9 @@ pub fn unapply(new: &str, diff: &str) -> Option<String> {
 /// A new file's text: its added lines, or the text itself when the change
 /// carries the content rather than a diff.
 pub fn added_text(diff: &str) -> String {
+    if !is_diff(diff) {
+        return diff.to_owned();
+    }
     let hunks = parse(diff);
     if hunks.is_empty() {
         return diff.to_owned();
@@ -169,7 +189,15 @@ pub fn before_after(kind: &str, old: Option<&str>, diff: &str) -> Option<(Option
     }
 }
 
+/// Whether a change carries a unified diff (else it is the file's text).
+fn is_diff(text: &str) -> bool {
+    text.starts_with("@@") || text.starts_with("--- ")
+}
+
 fn removed_text(diff: &str) -> String {
+    if !is_diff(diff) {
+        return diff.to_owned();
+    }
     let hunks = parse(diff);
     let mut s = hunks.iter().flat_map(|h| h.old.iter().cloned()).collect::<Vec<_>>().join("\n");
     if !s.is_empty() {

@@ -74,6 +74,19 @@ fn text_content(t: impl Into<String>) -> Value {
     json!({"type": "content", "content": {"type": "text", "text": t.into()}})
 }
 
+/// The most of a file read for a change's before text.
+const MAX_READ: u64 = 8 << 20;
+
+/// A regular file's text, up to `MAX_READ` bytes; None for anything else
+/// (a FIFO or device would block, a huge file is not worth a diff).
+fn read_small(path: &str) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_READ {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 /// The ACP `diff` blocks of a file change item, reading each file once.
 pub fn file_diffs(item: &Value) -> Vec<Value> {
     item.get("changes")
@@ -84,7 +97,7 @@ pub fn file_diffs(item: &Value) -> Vec<Value> {
             let path = s(c, "path")?;
             let kind = c.pointer("/kind/type").and_then(Value::as_str).unwrap_or("update");
             let diff = s(c, "diff").unwrap_or("");
-            let old = std::fs::read_to_string(path).ok();
+            let old = read_small(path);
             let target = c.pointer("/kind/move_path").and_then(Value::as_str).unwrap_or(path);
             match patch::before_after(kind, old.as_deref(), diff) {
                 Some((before, after)) => {

@@ -59,6 +59,30 @@ fn line(v: &Value) -> Vec<u8> {
     s
 }
 
+/// A writer task: lines from `rx` to `w`, flushed when the queue drains, so
+/// neither side's back-pressure stalls the read loop.
+fn writer<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
+    mut w: W,
+) -> (tokio::sync::mpsc::UnboundedSender<Vec<u8>>, tokio::task::JoinHandle<()>) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let task = tokio::spawn(async move {
+        while let Some(bytes) = rx.recv().await {
+            if w.write_all(&bytes).await.is_err() {
+                return;
+            }
+            while let Ok(more) = rx.try_recv() {
+                if w.write_all(&more).await.is_err() {
+                    return;
+                }
+            }
+            if w.flush().await.is_err() {
+                return;
+            }
+        }
+    });
+    (tx, task)
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let args = parse_args();
@@ -75,73 +99,53 @@ async fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let mut server_in = child.stdin.take().expect("piped stdin");
+    let (to_server, server_writer) = writer(child.stdin.take().expect("piped stdin"));
+    let (to_client, client_writer) = writer(tokio::io::stdout());
     let mut server_out = BufReader::new(child.stdout.take().expect("piped stdout")).lines();
     let mut client_in = BufReader::new(tokio::io::stdin()).lines();
-    let mut client_out = tokio::io::stdout();
     let tr = Translator::new(args.opts);
-
-    let mut outs = tr.start();
-    loop {
-        // Write what the last message produced; one flush per batch.
-        let (mut to_client, mut to_server) = (Vec::new(), Vec::new());
-        for o in outs.drain(..) {
-            match o {
-                Out::Client(v) => to_client.extend(line(&v)),
-                Out::Server(v) => to_server.extend(line(&v)),
-            }
+    let send = |outs: Vec<Out>| {
+        for o in outs {
+            let _ = match o {
+                Out::Client(v) => to_client.send(line(&v)),
+                Out::Server(v) => to_server.send(line(&v)),
+            };
         }
-        if !to_server.is_empty() && (server_in.write_all(&to_server).await.is_err() || server_in.flush().await.is_err())
-        {
-            outs = tr.server_closed("its stdin closed");
-            for o in outs.drain(..) {
-                if let Out::Client(v) = o {
-                    to_client.extend(line(&v));
-                }
-            }
-            let _ = client_out.write_all(&to_client).await;
-            let _ = client_out.flush().await;
-            return ExitCode::from(1);
-        }
-        if !to_client.is_empty()
-            && (client_out.write_all(&to_client).await.is_err() || client_out.flush().await.is_err())
-        {
-            break;
-        }
+    };
+    send(tr.start());
+    let code = loop {
         tokio::select! {
             next = client_in.next_line() => match next {
                 Ok(Some(l)) if l.trim().is_empty() => {}
                 Ok(Some(l)) => match serde_json::from_str::<Value>(&l) {
-                    Ok(v) => outs = tr.from_client(&v),
-                    Err(e) => eprintln!("cmux-codex-acp: bad client line: {e}"),
+                    Ok(v) => send(tr.from_client(&v)),
+                    Err(e) => {
+                        let reply = serde_json::json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": format!("parse error: {e}")}});
+                        let _ = to_client.send(line(&reply));
+                    }
                 },
-                // The client went away: let codex finish writing and exit.
-                _ => break,
+                // The client went away: stop codex and exit.
+                _ => break ExitCode::SUCCESS,
             },
             next = server_out.next_line() => match next {
                 Ok(Some(l)) if l.trim().is_empty() => {}
                 Ok(Some(l)) => match serde_json::from_str::<Value>(&l) {
-                    Ok(v) => outs = tr.from_server(&v),
+                    Ok(v) => send(tr.from_server(&v)),
                     Err(_) => eprintln!("codex app-server: {l}"),
                 },
                 _ => {
                     let status = child.wait().await.ok().and_then(|s| s.code());
-                    outs = tr.server_closed(&format!("exit code {status:?}"));
-                    let mut to_client = Vec::new();
-                    for o in outs.drain(..) {
-                        if let Out::Client(v) = o {
-                            to_client.extend(line(&v));
-                        }
-                    }
-                    let _ = client_out.write_all(&to_client).await;
-                    let _ = client_out.flush().await;
-                    return ExitCode::from(1);
+                    send(tr.server_closed(&format!("exit code {status:?}")));
+                    break ExitCode::from(1);
                 }
             },
         }
-    }
-    drop(server_in);
-    // Bounded: codex exits when its stdin closes; kill_on_drop ends a hang.
+    };
+    drop(to_server);
+    drop(to_client);
+    // Codex exits when its stdin closes; the bound and kill_on_drop end a hang.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), server_writer).await;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
-    ExitCode::SUCCESS
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), client_writer).await;
+    code
 }

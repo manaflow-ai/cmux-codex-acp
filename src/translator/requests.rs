@@ -38,7 +38,8 @@ fn option_for(decision: &Value) -> Option<(Value, Value)> {
         } else {
             (format!("Always allow {host}"), "allow_always")
         };
-        return Some((o(if deny { "denyNetworkHost" } else { "allowNetworkHost" }, name, kind), decision.clone()));
+        let id = format!("{}:{host}", if deny { "denyNetworkHost" } else { "allowNetworkHost" });
+        return Some((o(&id, name, kind), decision.clone()));
     }
     None
 }
@@ -67,7 +68,7 @@ impl State {
                     .get("availableDecisions")
                     .and_then(Value::as_array)
                     .cloned()
-                    .unwrap_or_else(|| vec![json!("accept"), json!("acceptForSession"), json!("decline")]);
+                    .unwrap_or_else(|| default_command_decisions(p));
                 self.ask(&thread, id, call, &decisions, Shape::Decision, out);
             }
             "item/fileChange/requestApproval" if known => {
@@ -151,6 +152,7 @@ impl State {
             "mcpServer/elicitation/request" => {
                 out.push(Out::Server(ok(&id, json!({"action": "decline"}))));
             }
+            "item/tool/requestUserInput" => out.push(Out::Server(ok(&id, json!({"answers": {}})))),
             _ if !known && method.contains("requestApproval") => {
                 // A thread this translator does not present: refuse.
                 out.push(Out::Server(ok(&id, json!({"decision": "decline"}))));
@@ -199,7 +201,7 @@ impl State {
         let cid = self.client_id();
         let decisions =
             options.iter().filter_map(|(o, d)| Some((o.get("optionId")?.as_str()?.to_owned(), d.clone()))).collect();
-        self.asked.insert(key(&cid), Asked { server_id, decisions, on_cancel, shape });
+        self.asked.insert(key(&cid), Asked { thread: thread.to_owned(), server_id, decisions, on_cancel, shape });
         let params = json!({
             "sessionId": thread,
             "toolCall": call,
@@ -207,4 +209,19 @@ impl State {
         });
         out.push(Out::Client(request(cid, "session/request_permission", params)));
     }
+}
+
+/// The decisions of a command approval from a server that does not list
+/// them: allow, allow for the session, allow the proposed command prefix and
+/// network rules when Codex proposes them, deny, deny and stop.
+fn default_command_decisions(p: &Value) -> Vec<Value> {
+    let mut d = vec![json!("accept"), json!("acceptForSession")];
+    if let Some(prefix) = p.get("proposedExecpolicyAmendment").filter(|a| a.is_array()) {
+        d.push(json!({"acceptWithExecpolicyAmendment": {"execpolicy_amendment": prefix}}));
+    }
+    for a in p.get("proposedNetworkPolicyAmendments").and_then(Value::as_array).into_iter().flatten() {
+        d.push(json!({"applyNetworkPolicyAmendment": {"network_policy_amendment": a}}));
+    }
+    d.extend([json!("decline"), json!("cancel")]);
+    d
 }

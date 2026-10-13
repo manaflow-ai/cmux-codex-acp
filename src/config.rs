@@ -154,9 +154,14 @@ pub fn models_value(models: &[ModelInfo], model: &str) -> Value {
 
 /// A model pick as `(model, effort)`. The codex-acp adapter named a model
 /// and effort together as `model/effort`; such a saved value still works.
-pub fn split_model(value: &str) -> (String, Option<String>) {
+pub fn split_model(value: &str, models: &[ModelInfo]) -> (String, Option<String>) {
+    // A known model id keeps its slash (`provider/model`).
+    if models.iter().any(|m| m.id == value) {
+        return (value.to_owned(), None);
+    }
+    const EFFORTS: [&str; 8] = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
     match value.rsplit_once('/') {
-        Some((m, e)) if !m.is_empty() && !e.is_empty() && !e.contains(':') => (m.to_owned(), Some(e.to_owned())),
+        Some((m, e)) if !m.is_empty() && EFFORTS.contains(&e) => (m.to_owned(), Some(e.to_owned())),
         _ => (value.to_owned(), None),
     }
 }
@@ -195,7 +200,9 @@ pub fn mcp_config(servers: Option<&Value>) -> Option<Value> {
                 e
             }
         };
-        out.insert(name.to_owned(), entry);
+        // Dotted keys add these servers beside the user's own; a whole
+        // `mcp_servers` table would replace them.
+        out.insert(format!("mcp_servers.{name}"), entry);
     }
-    (!out.is_empty()).then(|| json!({"mcp_servers": out}))
+    (!out.is_empty()).then_some(Value::Object(out))
 }

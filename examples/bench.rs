@@ -38,11 +38,11 @@ fn main() {
         let idle_rss = a.tree_rss_kib();
         let id = a.request("session/prompt", json!({"sessionId": sid, "prompt": [{"type": "text", "text": prompt}]}));
         let p0 = Instant::now();
-        a.until(Duration::from_secs(300), |m| {
+        a.until(Duration::from_secs(480), |m| {
             m["method"] == "session/update" && m["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
         });
         let first_token_ms = p0.elapsed().as_secs_f64() * 1e3;
-        let r = a.response(id, Duration::from_secs(300));
+        let r = a.response(id, Duration::from_secs(480));
         let turn_ms = p0.elapsed().as_secs_f64() * 1e3;
         let rss = a.tree_rss_kib();
         let row = json!({"run": run, "init_ms": init_ms, "session_ready_ms": ready_ms, "first_token_ms": first_token_ms, "turn_ms": turn_ms, "idle_rss_kib": idle_rss, "rss_kib": rss, "stop": r["result"]["stopReason"]});

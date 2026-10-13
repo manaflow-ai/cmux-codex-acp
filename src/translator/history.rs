@@ -39,7 +39,9 @@ impl State {
                     out.push(update(sid, json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": summary.join("\n\n")}})));
                 }
             }
-            "subAgentActivity" | "hookPrompt" | "functionCallOutput" | "enteredReviewMode" | "exitedReviewMode" => {}
+            // Subagents of the stored turns, so their sessions are known again.
+            "subAgentActivity" => self.subagent_activity(sid, item, out),
+            "hookPrompt" | "functionCallOutput" | "enteredReviewMode" | "exitedReviewMode" => {}
             "fileChange" => {
                 // The files have changed since: the stored diff is the record
                 // (no file reads for history).

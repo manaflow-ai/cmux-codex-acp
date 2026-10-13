@@ -86,7 +86,27 @@ impl State {
                 let Some(sid) = s(&p, "sessionId").map(str::to_owned) else {
                     return out.push(Out::Client(err(&id, INVALID_PARAMS, "sessionId is required")));
                 };
-                self.threads.retain(|tid, t| *tid != sid && t.parent.as_deref() != Some(sid.as_str()));
+                // A running turn ends first: its prompt is answered, its
+                // approvals are withdrawn, and Codex is told to stop.
+                self.cancel(&sid, out);
+                let family = self.family(&sid);
+                let withdrawn: Vec<String> =
+                    self.asked.iter().filter(|(_, a)| family.contains(&a.thread)).map(|(k, _)| k.clone()).collect();
+                for k in withdrawn {
+                    if let Some(a) = self.asked.remove(&k) {
+                        out.push(Out::Server(ok(&a.server_id, cancelled_answer(&a))));
+                    }
+                }
+                for tid in &family {
+                    if let Some(mut t) = self.threads.remove(tid) {
+                        if let Some(prompt) = t.prompt.take() {
+                            out.push(Out::Client(ok(&prompt, json!({"stopReason": "cancelled"}))));
+                        }
+                        for (steer, _) in t.queued_steers.drain(..) {
+                            out.push(Out::Client(err(&steer, INTERNAL, crate::STEER_NO_TURN)));
+                        }
+                    }
+                }
                 out.push(self.send(Pending::Ack { client: id }, "thread/unsubscribe", json!({"threadId": sid})));
             }
             "session/prompt" => self.prompt(id, &p, out),
@@ -176,7 +196,7 @@ impl State {
         let t = self.threads.get_mut(sid).ok_or_else(|| format!("unknown session {sid}"))?;
         match config_id {
             "model" => {
-                let (model, effort) = config::split_model(value);
+                let (model, effort) = config::split_model(value, &models);
                 t.model = model;
                 if let Some(e) = effort {
                     t.effort = e;
@@ -256,22 +276,29 @@ impl State {
             return out.push(Out::Client(err(&id, INVALID_PARAMS, format!("unknown session {sid}"))));
         };
         if steer {
-            let Some(turn) = t.turn.clone() else {
-                return out.push(Out::Client(err(&id, INTERNAL, crate::STEER_NO_TURN)));
-            };
-            let params = json!({"threadId": sid, "expectedTurnId": turn, "input": input});
-            return out.push(self.send(Pending::TurnSteer { client: id }, "turn/steer", params));
+            match (t.turn.clone(), t.starting) {
+                (Some(turn), _) => {
+                    let params = json!({"threadId": sid, "expectedTurnId": turn, "input": input});
+                    out.push(self.send(Pending::TurnSteer { client: id }, "turn/steer", params));
+                }
+                // The turn has no id yet: steer it once it has one.
+                (None, true) => self.threads.get_mut(&sid).expect("checked above").queued_steers.push((id, input)),
+                (None, false) => out.push(Out::Client(err(&id, INTERNAL, crate::STEER_NO_TURN))),
+            }
+            return;
         }
         if t.turn.is_some() || t.starting {
             return out.push(Out::Client(err(&id, INTERNAL, "a turn is already running in this session")));
         }
-        let mode = config::mode(&t.mode).unwrap_or(&config::MODES[2]);
-        let mut params = json!({
-            "threadId": sid,
-            "input": input,
-            "approvalPolicy": mode.approval,
-            "sandboxPolicy": config::sandbox_policy(mode),
-        });
+        let mut params = json!({"threadId": sid, "input": input});
+        // Approval and sandbox only when the mode changed: the app-server
+        // keeps them per thread, and a sandbox policy sent every turn would
+        // drop the user's own sandbox settings.
+        let mode_changed = t.mode != t.applied_mode;
+        if mode_changed && let Some(mode) = config::mode(&t.mode) {
+            params["approvalPolicy"] = json!(mode.approval);
+            params["sandboxPolicy"] = config::sandbox_policy(mode);
+        }
         if !t.model.is_empty() {
             params["model"] = json!(t.model);
         }
@@ -280,6 +307,9 @@ impl State {
         }
         let usage = t.usage.clone();
         let t = self.threads.get_mut(&sid).expect("checked above");
+        if mode_changed {
+            t.applied_mode = t.mode.clone();
+        }
         t.prompt = Some(id.clone());
         t.starting = true;
         t.cancel_pending = false;
@@ -289,10 +319,11 @@ impl State {
 
     /// Interrupts the session's turn and its subagents' turns.
     pub(super) fn cancel(&mut self, sid: &str, out: &mut Vec<Out>) {
-        let mut targets = vec![sid.to_owned()];
-        targets.extend(self.threads.iter().filter(|(_, t)| t.parent.as_deref() == Some(sid)).map(|(id, _)| id.clone()));
-        for tid in targets {
+        for tid in self.family(sid) {
             let Some(t) = self.threads.get_mut(&tid) else { continue };
+            for (steer, _) in t.queued_steers.drain(..) {
+                out.push(Out::Client(err(&steer, INTERNAL, crate::STEER_NO_TURN)));
+            }
             match t.turn.clone() {
                 Some(turn) => {
                     let params = json!({"threadId": tid, "turnId": turn});
@@ -316,21 +347,31 @@ impl State {
             .as_ref()
             .and_then(|c| asked.decisions.iter().find(|(o, _)| o == c).map(|(_, d)| d.clone()))
             .unwrap_or_else(|| asked.on_cancel.clone());
-        let result = match &asked.shape {
-            Shape::Decision => json!({"decision": decision}),
-            Shape::Permissions { asked: profile } => match decision.as_str() {
-                Some("session") => json!({"permissions": profile, "scope": "session"}),
-                Some("turn") => json!({"permissions": profile, "scope": "turn"}),
-                _ => json!({"permissions": {}, "scope": "turn"}),
-            },
-            Shape::Question { question_id } => {
-                let answers = match decision.as_str() {
-                    Some(label) if !label.is_empty() => json!([label]),
-                    _ => json!([]),
-                };
-                json!({"answers": {question_id.clone(): {"answers": answers}}})
-            }
-        };
+        let result = answer(&asked, &decision);
         out.push(Out::Server(ok(&asked.server_id, result)));
     }
+}
+
+/// The app-server answer for a permission decision.
+pub(super) fn answer(asked: &Asked, decision: &Value) -> Value {
+    match &asked.shape {
+        Shape::Decision => json!({"decision": decision}),
+        Shape::Permissions { asked: profile } => match decision.as_str() {
+            Some("session") => json!({"permissions": profile, "scope": "session"}),
+            Some("turn") => json!({"permissions": profile, "scope": "turn"}),
+            _ => json!({"permissions": {}, "scope": "turn"}),
+        },
+        Shape::Question { question_id } => {
+            let answers = match decision.as_str() {
+                Some(label) if !label.is_empty() => json!([label]),
+                _ => json!([]),
+            };
+            json!({"answers": {question_id.clone(): {"answers": answers}}})
+        }
+    }
+}
+
+/// The answer for an approval nobody will give (a closed session).
+pub(super) fn cancelled_answer(asked: &Asked) -> Value {
+    answer(asked, &asked.on_cancel)
 }

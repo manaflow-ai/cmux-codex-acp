@@ -73,15 +73,22 @@ impl State {
                 if let Some(t) = self.threads.get_mut(&thread) {
                     t.prompt = None;
                     t.starting = false;
+                    // The overrides may not have reached Codex: send them again.
+                    t.applied_mode.clear();
+                    for (steer, _) in t.queued_steers.drain(..) {
+                        out.push(Out::Client(err(&steer, INTERNAL, crate::STEER_NO_TURN)));
+                    }
                 }
                 out.push(Out::Client(err(&client, code, message)));
             }
             Pending::TurnSteer { client } => {
                 // The turn ended (or moved on) before the steer reached it.
-                let no_turn = message.contains("no active turn")
-                    || message.contains("expected")
-                    || message.contains("not running")
-                    || message.contains("mismatch");
+                let lower = message.to_lowercase();
+                let no_turn = lower.contains("no active turn")
+                    || lower.contains("expectedturnid")
+                    || lower.contains("expected turn")
+                    || lower.contains("not the active turn")
+                    || lower.contains("does not match");
                 let message = if no_turn { format!("{}: {message}", crate::STEER_NO_TURN) } else { message };
                 out.push(Out::Client(err(&client, INTERNAL, message)));
             }
@@ -172,14 +179,28 @@ impl State {
             Pending::TurnStart { client: _, thread } => {
                 let turn = r.pointer("/turn/id").and_then(Value::as_str).map(str::to_owned);
                 let Some(t) = self.threads.get_mut(&thread) else { return };
-                t.starting = false;
-                if t.turn.is_none() {
-                    t.turn = turn.clone();
+                // The turn may have started and ended before this answer: then
+                // `turn/completed` already answered the prompt and cleared
+                // `starting`, and the finished turn must not be taken as running.
+                if !std::mem::take(&mut t.starting) {
+                    return;
                 }
-                if std::mem::take(&mut t.cancel_pending)
-                    && let Some(turn) = t.turn.clone()
-                {
+                if t.turn.is_none() {
+                    t.turn = turn;
+                }
+                let steers = std::mem::take(&mut t.queued_steers);
+                let cancel = std::mem::take(&mut t.cancel_pending);
+                let Some(turn) = t.turn.clone() else { return };
+                if cancel {
+                    for (steer, _) in steers {
+                        out.push(Out::Client(err(&steer, INTERNAL, crate::STEER_NO_TURN)));
+                    }
                     out.push(self.send(Pending::Ignore, "turn/interrupt", json!({"threadId": thread, "turnId": turn})));
+                    return;
+                }
+                for (steer, input) in steers {
+                    let params = json!({"threadId": thread, "expectedTurnId": turn, "input": input});
+                    out.push(self.send(Pending::TurnSteer { client: steer }, "turn/steer", params));
                 }
             }
             Pending::TurnSteer { client } => out.push(Out::Client(ok(&client, json!({"stopReason": "steered"})))),
@@ -193,6 +214,8 @@ impl State {
         let known = thread.as_deref().is_some_and(|t| self.threads.contains_key(t));
         match method {
             "account/rateLimits/updated" => return self.rate_limits(p, out),
+            // A subagent thread whose parent this translator presents.
+            "thread/started" => return self.thread_started(p.get("thread").unwrap_or(&Value::Null), out),
             _ if !known => return,
             _ => {}
         }
@@ -245,17 +268,28 @@ impl State {
             "item/commandExecution/outputDelta" => {
                 let (Some(item), Some(delta)) = (s(p, "itemId"), s(p, "delta")) else { return };
                 let Some(t) = self.threads.get_mut(&sid) else { return };
-                let buf = t.output.entry(item.to_owned()).or_default();
+                let (buf, unsent) = t.output.entry(item.to_owned()).or_default();
                 buf.push_str(delta);
-                out.push(update(
-                    &sid,
-                    json!({
-                        "sessionUpdate": "tool_call_update",
-                        "toolCallId": item,
-                        "content": [{"type": "content", "content": {"type": "text", "text": tail(buf)}}],
-                        "_meta": {"terminal_output_delta": {"terminal_id": item, "data": delta}},
-                    }),
-                ));
+                *unsent += delta.len();
+                // Keep only the tail a client is shown.
+                if buf.len() > 2 * OUTPUT_TAIL {
+                    *buf = tail(buf).to_owned();
+                }
+                let mut u = json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": item,
+                    "_meta": {"terminal_output_delta": {"terminal_id": item, "data": delta}},
+                });
+                // The content (which replaces the call's whole output) goes
+                // with a delta once the new bytes are an eighth of what it
+                // carries, so the bytes sent stay linear in the output; every
+                // delta still goes out at once in `terminal_output_delta`.
+                let shown = tail(buf);
+                if shown.len() <= 4096 || *unsent * 8 >= shown.len() {
+                    u["content"] = json!([{"type": "content", "content": {"type": "text", "text": shown}}]);
+                    *unsent = 0;
+                }
+                out.push(update(&sid, u));
             }
             "item/fileChange/patchUpdated" => {
                 let Some(item) = s(p, "itemId") else { return };
@@ -301,7 +335,7 @@ impl State {
                 out.push(update(&sid, json!({"sessionUpdate": "usage_update", "used": used, "size": size, "_meta": {"codexAppServer": {"tokenUsage": usage}}})));
             }
             "thread/name/updated" => {
-                out.push(update(&sid, json!({"sessionUpdate": "session_info_update", "title": p.get("name").cloned().unwrap_or(Value::Null)})));
+                out.push(update(&sid, json!({"sessionUpdate": "session_info_update", "title": p.get("threadName").cloned().unwrap_or(Value::Null)})));
             }
             "model/rerouted" => {
                 if let (Some(t), Some(to)) = (self.threads.get_mut(&sid), s(p, "toModel")) {
@@ -316,7 +350,13 @@ impl State {
                 // Answered or withdrawn on the server side (an interrupt): a
                 // late client answer has nothing to answer.
                 if let Some(rid) = p.get("requestId") {
-                    self.asked.retain(|_, a| a.server_id != *rid);
+                    let gone: Vec<String> =
+                        self.asked.iter().filter(|(_, a)| a.server_id == *rid).map(|(k, _)| k.clone()).collect();
+                    for k in gone {
+                        self.asked.remove(&k);
+                        let id: Value = serde_json::from_str(&k).unwrap_or(Value::String(k));
+                        out.push(Out::Client(notification("$/cancel_request", json!({"requestId": id}))));
+                    }
                 }
             }
             _ => {}
@@ -331,10 +371,16 @@ impl State {
         }
         t.turn = None;
         t.starting = false;
+        let steers = std::mem::take(&mut t.queued_steers);
         t.output.clear();
         t.tools.clear();
         t.streamed.clear();
-        let Some(prompt) = t.prompt.take() else { return };
+        let prompt = t.prompt.take();
+        for (steer, _) in steers {
+            out.push(Out::Client(err(&steer, INTERNAL, crate::STEER_NO_TURN)));
+        }
+        let Some(prompt) = prompt else { return };
+        let t = self.threads.get(sid).expect("checked above");
         let usage = usage_delta(t.usage_at_start.as_ref(), t.usage.as_ref());
         match s(turn, "status") {
             Some("failed") => {
@@ -421,7 +467,7 @@ impl State {
 
     /// Subagent start and end from a `subAgentActivity` item (multi-agent
     /// v2): the child thread's id is its ACP session id.
-    fn subagent_activity(&mut self, sid: &str, item: &Value, out: &mut Vec<Out>) {
+    pub(super) fn subagent_activity(&mut self, sid: &str, item: &Value, out: &mut Vec<Out>) {
         let Some(child) = s(item, "agentThreadId").map(str::to_owned) else { return };
         let path = s(item, "agentPath").unwrap_or("");
         let name = path.rsplit('/').find(|p| !p.is_empty()).unwrap_or("agent").to_owned();
@@ -516,6 +562,19 @@ impl State {
             parent,
             json!({"sessionUpdate": "subagent_state_update", "subagentSessionId": child, "state": state}),
         ));
+    }
+
+    /// A thread started with a parent this translator presents: a subagent
+    /// (multi-agent runs that announce children this way).
+    fn thread_started(&mut self, thread: &Value, out: &mut Vec<Out>) {
+        let (Some(id), Some(parent)) = (s(thread, "id"), s(thread, "parentThreadId")) else { return };
+        if self.threads.contains_key(id) || !self.threads.contains_key(parent) {
+            return;
+        }
+        let name = s(thread, "agentNickname").or(s(thread, "agentRole")).unwrap_or("agent").to_owned();
+        let meta = json!({"codexAppServer": {"agentRole": thread.get("agentRole"), "model": thread.get("model")}});
+        let (id, parent) = (id.to_owned(), parent.to_owned());
+        self.subagent(&parent, &id, &name, None, "running", meta, None, out);
     }
 
     fn rate_limits(&mut self, p: &Value, out: &mut Vec<Out>) {
