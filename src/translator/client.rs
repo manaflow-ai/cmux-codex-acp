@@ -1,0 +1,336 @@
+//! ACP client -> app-server.
+
+use super::*;
+use crate::content;
+
+fn s<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
+    v.get(k).and_then(Value::as_str)
+}
+
+impl State {
+    pub(super) fn client(&mut self, msg: &Value, out: &mut Vec<Out>) {
+        let method = s(msg, "method");
+        let id = msg.get("id").cloned();
+        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+        match (method, id) {
+            // A response to a request we sent the client (a permission).
+            (None, Some(id)) => self.client_answer(&id, msg, out),
+            (Some("initialize"), Some(id)) => {
+                if let Some(e) = &self.init_failed {
+                    out.push(Out::Client(err(&id, INTERNAL, e.clone())));
+                } else if self.initialized {
+                    out.push(Out::Client(ok(&id, self.initialize_result())));
+                } else {
+                    self.waiting_init.push(id);
+                }
+            }
+            (Some(_), _) if !self.initialized => {
+                if let (Some(e), Some(id)) = (&self.init_failed, msg.get("id")) {
+                    out.push(Out::Client(err(id, INTERNAL, e.clone())));
+                } else {
+                    self.queued.push(msg.clone());
+                }
+            }
+            (Some(m), Some(id)) => self.client_request(m, id, params, out),
+            (Some(m), None) => self.client_notification(m, params, out),
+            (None, None) => {}
+        }
+    }
+
+    pub(super) fn initialize_result(&self) -> Value {
+        json!({
+            "protocolVersion": 1,
+            "agentCapabilities": {
+                "loadSession": true,
+                "promptCapabilities": {"image": true, "audio": false, "embeddedContext": true},
+                "mcpCapabilities": {"http": true, "sse": false},
+                "sessionCapabilities": {"fork": {}, "resume": {}, "list": {}, "close": {}},
+            },
+            "agentInfo": {"name": "cmux-codex-acp", "title": "Codex", "version": env!("CARGO_PKG_VERSION")},
+            "authMethods": [],
+            "_meta": {
+                "steering": {"supported": true},
+                "codexAppServer": {"userAgent": self.user_agent, "testedVersion": crate::CODEX_TESTED_VERSION},
+            },
+        })
+    }
+
+    /// Runs the client messages that waited for the server's `initialize`.
+    pub(super) fn drain_queued(&mut self, out: &mut Vec<Out>) {
+        for id in std::mem::take(&mut self.waiting_init) {
+            out.push(Out::Client(ok(&id, self.initialize_result())));
+        }
+        for m in std::mem::take(&mut self.queued) {
+            self.client(&m, out);
+        }
+    }
+
+    fn client_request(&mut self, method: &str, id: Value, p: Value, out: &mut Vec<Out>) {
+        match method {
+            "authenticate" => out.push(Out::Client(ok(&id, json!({})))),
+            "session/new" => self.session_new(id, &p, out),
+            "session/load" => self.session_resume(id, &p, true, out),
+            "session/resume" => self.session_resume(id, &p, false, out),
+            "session/fork" => self.session_fork(id, &p, out),
+            "session/list" => {
+                let mut params = json!({"limit": 50});
+                if let Some(cwd) = p.get("cwd").filter(|c| c.is_string()) {
+                    params["cwd"] = cwd.clone();
+                }
+                if let Some(c) = p.get("cursor").filter(|c| c.is_string()) {
+                    params["cursor"] = c.clone();
+                }
+                out.push(self.send(Pending::ThreadList { client: id }, "thread/list", params));
+            }
+            "session/close" => {
+                let Some(sid) = s(&p, "sessionId").map(str::to_owned) else {
+                    return out.push(Out::Client(err(&id, INVALID_PARAMS, "sessionId is required")));
+                };
+                self.threads.retain(|tid, t| *tid != sid && t.parent.as_deref() != Some(sid.as_str()));
+                out.push(self.send(Pending::Ack { client: id }, "thread/unsubscribe", json!({"threadId": sid})));
+            }
+            "session/prompt" => self.prompt(id, &p, out),
+            "session/set_mode" => {
+                let (Some(sid), Some(mode)) = (s(&p, "sessionId"), s(&p, "modeId")) else {
+                    return out.push(Out::Client(err(&id, INVALID_PARAMS, "sessionId and modeId are required")));
+                };
+                match self.set_mode(sid, mode) {
+                    Ok(()) => {
+                        out.push(Out::Client(ok(&id, json!({}))));
+                        out.push(update(sid, json!({"sessionUpdate": "current_mode_update", "currentModeId": mode})));
+                        out.push(update(
+                            sid,
+                            json!({"sessionUpdate": "config_option_update", "configOptions": self.config_options(sid)}),
+                        ));
+                    }
+                    Err(e) => out.push(Out::Client(err(&id, INVALID_PARAMS, e))),
+                }
+            }
+            "session/set_model" => {
+                let (Some(sid), Some(model)) = (s(&p, "sessionId"), s(&p, "modelId")) else {
+                    return out.push(Out::Client(err(&id, INVALID_PARAMS, "sessionId and modelId are required")));
+                };
+                match self.set_option(sid, "model", model) {
+                    Ok(()) => {
+                        out.push(Out::Client(ok(&id, json!({}))));
+                        out.push(update(
+                            sid,
+                            json!({"sessionUpdate": "config_option_update", "configOptions": self.config_options(sid)}),
+                        ));
+                    }
+                    Err(e) => out.push(Out::Client(err(&id, INVALID_PARAMS, e))),
+                }
+            }
+            "session/set_config_option" => {
+                let (Some(sid), Some(config_id)) = (s(&p, "sessionId"), s(&p, "configId")) else {
+                    return out.push(Out::Client(err(&id, INVALID_PARAMS, "sessionId and configId are required")));
+                };
+                let value = match p.get("value") {
+                    Some(Value::String(v)) => v.clone(),
+                    Some(Value::Bool(b)) => b.to_string(),
+                    _ => return out.push(Out::Client(err(&id, INVALID_PARAMS, "value must be a string"))),
+                };
+                let result = if config_id == "mode" {
+                    self.set_mode(sid, &value)
+                } else {
+                    self.set_option(sid, config_id, &value)
+                };
+                match result {
+                    Ok(()) => {
+                        out.push(Out::Client(ok(&id, json!({"configOptions": self.config_options(sid)}))));
+                        if config_id == "mode" {
+                            out.push(update(
+                                sid,
+                                json!({"sessionUpdate": "current_mode_update", "currentModeId": value}),
+                            ));
+                        }
+                    }
+                    Err(e) => out.push(Out::Client(err(&id, INVALID_PARAMS, e))),
+                }
+            }
+            other => out.push(Out::Client(err(&id, METHOD_NOT_FOUND, format!("method not found: {other}")))),
+        }
+    }
+
+    fn client_notification(&mut self, method: &str, p: Value, out: &mut Vec<Out>) {
+        if method == "session/cancel"
+            && let Some(sid) = s(&p, "sessionId")
+        {
+            self.cancel(sid, out);
+        }
+    }
+
+    fn set_mode(&mut self, sid: &str, mode: &str) -> Result<(), String> {
+        if config::mode(mode).is_none() {
+            return Err(format!("unknown mode {mode:?}"));
+        }
+        let t = self.threads.get_mut(sid).ok_or_else(|| format!("unknown session {sid}"))?;
+        t.mode = mode.to_owned();
+        Ok(())
+    }
+
+    /// A model or effort pick; it applies from the next turn on (Codex takes
+    /// both per turn), including a turn started while one runs.
+    fn set_option(&mut self, sid: &str, config_id: &str, value: &str) -> Result<(), String> {
+        let models = self.models.clone();
+        let t = self.threads.get_mut(sid).ok_or_else(|| format!("unknown session {sid}"))?;
+        match config_id {
+            "model" => {
+                let (model, effort) = config::split_model(value);
+                t.model = model;
+                if let Some(e) = effort {
+                    t.effort = e;
+                }
+                // An effort the new model lacks falls back to its default.
+                if let Some(m) = models.iter().find(|m| m.id == t.model)
+                    && t.effort != config::DEFAULT_EFFORT
+                    && !m.efforts.iter().any(|(e, _)| *e == t.effort)
+                {
+                    t.effort = config::DEFAULT_EFFORT.into();
+                }
+                Ok(())
+            }
+            "reasoning_effort" | "effort" | "thought_level" => {
+                t.effort = value.to_owned();
+                Ok(())
+            }
+            other => Err(format!("unknown config option {other:?}")),
+        }
+    }
+
+    fn thread_params(&self, p: &Value, mode: &str) -> Value {
+        let m = config::mode(mode).unwrap_or(&config::MODES[2]);
+        let mut params = json!({"approvalPolicy": m.approval, "sandbox": m.sandbox});
+        if let Some(cwd) = p.get("cwd").filter(|c| c.is_string()) {
+            params["cwd"] = cwd.clone();
+        }
+        if let Some(cfg) = config::mcp_config(p.get("mcpServers")) {
+            params["config"] = cfg;
+        }
+        params
+    }
+
+    fn session_new(&mut self, id: Value, p: &Value, out: &mut Vec<Out>) {
+        let mode = self.opts.default_mode.clone();
+        let mut params = self.thread_params(p, &mode);
+        if let Some(m) = &self.opts.model {
+            params["model"] = json!(m);
+        }
+        let effort = self.opts.effort.clone().unwrap_or_else(|| config::DEFAULT_EFFORT.into());
+        out.push(self.send(Pending::ThreadStart { client: id, mode, effort }, "thread/start", params));
+    }
+
+    fn session_resume(&mut self, id: Value, p: &Value, replay: bool, out: &mut Vec<Out>) {
+        let Some(sid) = s(p, "sessionId").map(str::to_owned) else {
+            return out.push(Out::Client(err(&id, INVALID_PARAMS, "sessionId is required")));
+        };
+        let mode = self.threads.get(&sid).map(|t| t.mode.clone()).unwrap_or_else(|| self.opts.default_mode.clone());
+        let mut params = self.thread_params(p, &mode);
+        params["threadId"] = json!(sid);
+        params["excludeTurns"] = json!(!replay);
+        out.push(self.send(Pending::ThreadResume { client: id, session: sid, mode, replay }, "thread/resume", params));
+    }
+
+    fn session_fork(&mut self, id: Value, p: &Value, out: &mut Vec<Out>) {
+        let Some(sid) = s(p, "sessionId").map(str::to_owned) else {
+            return out.push(Out::Client(err(&id, INVALID_PARAMS, "sessionId is required")));
+        };
+        let mode = self.threads.get(&sid).map(|t| t.mode.clone()).unwrap_or_else(|| self.opts.default_mode.clone());
+        let mut params = self.thread_params(p, &mode);
+        params["threadId"] = json!(sid);
+        params["excludeTurns"] = json!(true);
+        if let Some(last) = p.pointer("/_meta/lastTurnId").filter(|v| v.is_string()) {
+            params["lastTurnId"] = last.clone();
+        }
+        out.push(self.send(Pending::ThreadFork { client: id, mode }, "thread/fork", params));
+    }
+
+    fn prompt(&mut self, id: Value, p: &Value, out: &mut Vec<Out>) {
+        let Some(sid) = s(p, "sessionId").map(str::to_owned) else {
+            return out.push(Out::Client(err(&id, INVALID_PARAMS, "sessionId is required")));
+        };
+        let blocks: Vec<Value> = p.get("prompt").and_then(Value::as_array).cloned().unwrap_or_default();
+        let input = content::user_input(&blocks);
+        let steer = p.pointer("/_meta/steer").and_then(Value::as_bool) == Some(true);
+        let Some(t) = self.threads.get(&sid) else {
+            return out.push(Out::Client(err(&id, INVALID_PARAMS, format!("unknown session {sid}"))));
+        };
+        if steer {
+            let Some(turn) = t.turn.clone() else {
+                return out.push(Out::Client(err(&id, INTERNAL, crate::STEER_NO_TURN)));
+            };
+            let params = json!({"threadId": sid, "expectedTurnId": turn, "input": input});
+            return out.push(self.send(Pending::TurnSteer { client: id }, "turn/steer", params));
+        }
+        if t.turn.is_some() || t.starting {
+            return out.push(Out::Client(err(&id, INTERNAL, "a turn is already running in this session")));
+        }
+        let mode = config::mode(&t.mode).unwrap_or(&config::MODES[2]);
+        let mut params = json!({
+            "threadId": sid,
+            "input": input,
+            "approvalPolicy": mode.approval,
+            "sandboxPolicy": config::sandbox_policy(mode),
+        });
+        if !t.model.is_empty() {
+            params["model"] = json!(t.model);
+        }
+        if t.effort != config::DEFAULT_EFFORT && !t.effort.is_empty() {
+            params["effort"] = json!(t.effort);
+        }
+        let usage = t.usage.clone();
+        let t = self.threads.get_mut(&sid).expect("checked above");
+        t.prompt = Some(id.clone());
+        t.starting = true;
+        t.cancel_pending = false;
+        t.usage_at_start = usage;
+        out.push(self.send(Pending::TurnStart { client: id, thread: sid }, "turn/start", params));
+    }
+
+    /// Interrupts the session's turn and its subagents' turns.
+    pub(super) fn cancel(&mut self, sid: &str, out: &mut Vec<Out>) {
+        let mut targets = vec![sid.to_owned()];
+        targets.extend(self.threads.iter().filter(|(_, t)| t.parent.as_deref() == Some(sid)).map(|(id, _)| id.clone()));
+        for tid in targets {
+            let Some(t) = self.threads.get_mut(&tid) else { continue };
+            match t.turn.clone() {
+                Some(turn) => {
+                    let params = json!({"threadId": tid, "turnId": turn});
+                    out.push(self.send(Pending::Ignore, "turn/interrupt", params));
+                }
+                None if t.starting => t.cancel_pending = true,
+                None => {}
+            }
+        }
+    }
+
+    /// The client answered a permission request.
+    fn client_answer(&mut self, id: &Value, msg: &Value, out: &mut Vec<Out>) {
+        let Some(asked) = self.asked.remove(&key(id)) else { return };
+        let outcome = msg.pointer("/result/outcome");
+        let chosen = match outcome.and_then(|o| s(o, "outcome")) {
+            Some("selected") => outcome.and_then(|o| s(o, "optionId")).map(str::to_owned),
+            _ => None,
+        };
+        let decision = chosen
+            .as_ref()
+            .and_then(|c| asked.decisions.iter().find(|(o, _)| o == c).map(|(_, d)| d.clone()))
+            .unwrap_or_else(|| asked.on_cancel.clone());
+        let result = match &asked.shape {
+            Shape::Decision => json!({"decision": decision}),
+            Shape::Permissions { asked: profile } => match decision.as_str() {
+                Some("session") => json!({"permissions": profile, "scope": "session"}),
+                Some("turn") => json!({"permissions": profile, "scope": "turn"}),
+                _ => json!({"permissions": {}, "scope": "turn"}),
+            },
+            Shape::Question { question_id } => {
+                let answers = match decision.as_str() {
+                    Some(label) if !label.is_empty() => json!([label]),
+                    _ => json!([]),
+                };
+                json!({"answers": {question_id.clone(): {"answers": answers}}})
+            }
+        };
+        out.push(Out::Server(ok(&asked.server_id, result)));
+    }
+}

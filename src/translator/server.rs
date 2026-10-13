@@ -1,0 +1,559 @@
+//! app-server -> ACP client: responses and notifications.
+
+use super::*;
+use crate::items;
+
+fn s<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
+    v.get(k).and_then(Value::as_str)
+}
+
+/// The most of a running command's output one update carries: each update
+/// replaces the call's content, so a long output is sent as its tail.
+const OUTPUT_TAIL: usize = 64 * 1024;
+
+fn tail(text: &str) -> &str {
+    if text.len() <= OUTPUT_TAIL {
+        return text;
+    }
+    let mut at = text.len() - OUTPUT_TAIL;
+    while !text.is_char_boundary(at) {
+        at += 1;
+    }
+    &text[at..]
+}
+
+fn usage_delta(start: Option<&Value>, now: Option<&Value>) -> Option<Value> {
+    let now = now?.get("total")?;
+    let n = |v: Option<&Value>, k: &str| v.and_then(|v| v.get(k)).and_then(Value::as_u64).unwrap_or(0);
+    let before = start.and_then(|s| s.get("total"));
+    let d = |k: &str| n(Some(now), k).saturating_sub(n(before, k));
+    Some(json!({
+        "inputTokens": d("inputTokens"),
+        "outputTokens": d("outputTokens"),
+        "totalTokens": d("totalTokens"),
+        "cachedReadTokens": d("cachedInputTokens"),
+        "thoughtTokens": d("reasoningOutputTokens"),
+    }))
+}
+
+impl State {
+    pub(super) fn server(&mut self, msg: &Value, out: &mut Vec<Out>) {
+        match (s(msg, "method"), msg.get("id")) {
+            (Some(method), Some(id)) => {
+                let (method, id) = (method.to_owned(), id.clone());
+                self.server_request(&method, id, msg.get("params").unwrap_or(&Value::Null), out)
+            }
+            (Some(method), None) => {
+                let method = method.to_owned();
+                self.server_notification(&method, msg.get("params").unwrap_or(&Value::Null), out)
+            }
+            (None, Some(id)) => {
+                let Some(pending) = self.pending.remove(&key(id)) else { return };
+                match msg.get("error") {
+                    Some(e) => self.server_error(pending, e, out),
+                    None => self.server_result(pending, msg.get("result").unwrap_or(&Value::Null), out),
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    fn server_error(&mut self, pending: Pending, e: &Value, out: &mut Vec<Out>) {
+        let message = s(e, "message").unwrap_or("codex app-server error").to_owned();
+        let code = e.get("code").and_then(Value::as_i64).unwrap_or(INTERNAL);
+        match pending {
+            Pending::Initialize => {
+                self.init_failed = Some(format!("codex app-server initialize failed: {message}"));
+                for id in std::mem::take(&mut self.waiting_init) {
+                    out.push(Out::Client(err(&id, INTERNAL, self.init_failed.clone().unwrap_or_default())));
+                }
+            }
+            Pending::ModelList | Pending::Ignore => {}
+            Pending::TurnStart { client, thread } => {
+                if let Some(t) = self.threads.get_mut(&thread) {
+                    t.prompt = None;
+                    t.starting = false;
+                }
+                out.push(Out::Client(err(&client, code, message)));
+            }
+            Pending::TurnSteer { client } => {
+                // The turn ended (or moved on) before the steer reached it.
+                let no_turn = message.contains("no active turn")
+                    || message.contains("expected")
+                    || message.contains("not running")
+                    || message.contains("mismatch");
+                let message = if no_turn { format!("{}: {message}", crate::STEER_NO_TURN) } else { message };
+                out.push(Out::Client(err(&client, INTERNAL, message)));
+            }
+            Pending::ThreadStart { client, .. }
+            | Pending::ThreadResume { client, .. }
+            | Pending::ThreadFork { client, .. }
+            | Pending::ThreadList { client }
+            | Pending::Ack { client } => out.push(Out::Client(err(&client, code, message))),
+        }
+    }
+
+    fn server_result(&mut self, pending: Pending, r: &Value, out: &mut Vec<Out>) {
+        match pending {
+            Pending::Initialize => {
+                self.initialized = true;
+                self.user_agent = s(r, "userAgent").map(str::to_owned);
+                out.push(Out::Server(notification("initialized", json!({}))));
+                out.push(self.send(Pending::ModelList, "model/list", json!({})));
+                self.drain_queued(out);
+            }
+            Pending::ModelList => {
+                self.models = config::parse_models(r);
+                let default = self.models.iter().find(|m| m.is_default).map(|m| m.id.clone());
+                for sid in self.threads.keys().cloned().collect::<Vec<_>>() {
+                    if let (Some(t), Some(d)) = (self.threads.get_mut(&sid), &default)
+                        && t.model.is_empty()
+                    {
+                        t.model = d.clone();
+                    }
+                }
+                for sid in self.roots() {
+                    out.push(update(
+                        &sid,
+                        json!({"sessionUpdate": "config_option_update", "configOptions": self.config_options(&sid)}),
+                    ));
+                }
+            }
+            Pending::ThreadStart { client, mode, effort } => match self.adopt_thread(r, mode, Some(effort)) {
+                Some(sid) => {
+                    let extra = json!({"_meta": {"codexAppServer": {"threadPath": r.pointer("/thread/path"), "cliVersion": r.pointer("/thread/cliVersion"), "model": r.get("model")}}});
+                    out.push(Out::Client(ok(&client, self.session_result(&sid, extra))));
+                }
+                None => out.push(Out::Client(err(&client, INTERNAL, "thread/start returned no thread"))),
+            },
+            Pending::ThreadResume { client, session, mode, replay } => {
+                let effort = self.threads.get(&session).map(|t| t.effort.clone());
+                let Some(sid) = self.adopt_thread(r, mode, effort) else {
+                    return out.push(Out::Client(err(&client, INTERNAL, "thread/resume returned no thread")));
+                };
+                if replay {
+                    self.replay(&sid, r.pointer("/thread/turns"), out);
+                }
+                // A thread resumed mid-turn (still live in this app-server).
+                if let Some(turn) = r
+                    .pointer("/thread/turns")
+                    .and_then(Value::as_array)
+                    .and_then(|t| t.last())
+                    .filter(|t| s(t, "status") == Some("inProgress"))
+                    .and_then(|t| s(t, "id"))
+                    && let Some(t) = self.threads.get_mut(&sid)
+                {
+                    t.turn = Some(turn.to_owned());
+                }
+                out.push(Out::Client(ok(&client, self.session_result(&sid, json!({})))));
+            }
+            Pending::ThreadFork { client, mode } => match self.adopt_thread(r, mode, None) {
+                Some(sid) => out.push(Out::Client(ok(&client, self.session_result(&sid, json!({}))))),
+                None => out.push(Out::Client(err(&client, INTERNAL, "thread/fork returned no thread"))),
+            },
+            Pending::ThreadList { client } => {
+                let sessions: Vec<Value> = r
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .map(|t| {
+                        let title = s(t, "name").filter(|n| !n.is_empty()).or(s(t, "preview"));
+                        json!({
+                            "sessionId": t.get("id"),
+                            "cwd": t.get("cwd"),
+                            "title": title,
+                            "updatedAt": t.get("updatedAt").and_then(Value::as_i64).map(rfc3339),
+                        })
+                    })
+                    .collect();
+                out.push(Out::Client(ok(&client, json!({"sessions": sessions, "nextCursor": r.get("nextCursor")}))));
+            }
+            Pending::TurnStart { client: _, thread } => {
+                let turn = r.pointer("/turn/id").and_then(Value::as_str).map(str::to_owned);
+                let Some(t) = self.threads.get_mut(&thread) else { return };
+                t.starting = false;
+                if t.turn.is_none() {
+                    t.turn = turn.clone();
+                }
+                if std::mem::take(&mut t.cancel_pending)
+                    && let Some(turn) = t.turn.clone()
+                {
+                    out.push(self.send(Pending::Ignore, "turn/interrupt", json!({"threadId": thread, "turnId": turn})));
+                }
+            }
+            Pending::TurnSteer { client } => out.push(Out::Client(ok(&client, json!({"stopReason": "steered"})))),
+            Pending::Ack { client } => out.push(Out::Client(ok(&client, json!({})))),
+            Pending::Ignore => {}
+        }
+    }
+
+    fn server_notification(&mut self, method: &str, p: &Value, out: &mut Vec<Out>) {
+        let thread = s(p, "threadId").map(str::to_owned);
+        let known = thread.as_deref().is_some_and(|t| self.threads.contains_key(t));
+        match method {
+            "account/rateLimits/updated" => return self.rate_limits(p, out),
+            _ if !known => return,
+            _ => {}
+        }
+        let sid = thread.expect("known thread");
+        match method {
+            "turn/started" => {
+                if let (Some(t), Some(turn)) =
+                    (self.threads.get_mut(&sid), p.pointer("/turn/id").and_then(Value::as_str))
+                {
+                    t.turn = Some(turn.to_owned());
+                    t.starting = false;
+                }
+            }
+            "turn/completed" => self.turn_completed(&sid, p.get("turn").unwrap_or(&Value::Null), out),
+            "item/started" => {
+                if let Some(item) = p.get("item") {
+                    self.item(&sid, item, false, out);
+                }
+            }
+            "item/completed" => {
+                if let Some(item) = p.get("item") {
+                    self.item(&sid, item, true, out);
+                }
+            }
+            "item/agentMessage/delta" => {
+                let (Some(item), Some(delta)) = (s(p, "itemId"), s(p, "delta")) else { return };
+                if let Some(t) = self.threads.get_mut(&sid) {
+                    t.streamed.insert(item.to_owned());
+                }
+                out.push(update(&sid, json!({"sessionUpdate": "agent_message_chunk", "messageId": item, "content": {"type": "text", "text": delta}})));
+            }
+            "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+                let (Some(item), Some(delta)) = (s(p, "itemId"), s(p, "delta")) else { return };
+                if let Some(t) = self.threads.get_mut(&sid) {
+                    t.streamed.insert(item.to_owned());
+                }
+                out.push(update(
+                    &sid,
+                    json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": delta}}),
+                ));
+            }
+            "item/reasoning/summaryPartAdded" => {
+                if p.get("summaryIndex").and_then(Value::as_u64).unwrap_or(0) > 0 {
+                    out.push(update(
+                        &sid,
+                        json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "\n\n"}}),
+                    ));
+                }
+            }
+            "item/commandExecution/outputDelta" => {
+                let (Some(item), Some(delta)) = (s(p, "itemId"), s(p, "delta")) else { return };
+                let Some(t) = self.threads.get_mut(&sid) else { return };
+                let buf = t.output.entry(item.to_owned()).or_default();
+                buf.push_str(delta);
+                out.push(update(
+                    &sid,
+                    json!({
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": item,
+                        "content": [{"type": "content", "content": {"type": "text", "text": tail(buf)}}],
+                        "_meta": {"terminal_output_delta": {"terminal_id": item, "data": delta}},
+                    }),
+                ));
+            }
+            "item/fileChange/patchUpdated" => {
+                let Some(item) = s(p, "itemId") else { return };
+                let fake =
+                    json!({"type": "fileChange", "id": item, "changes": p.get("changes"), "status": "inProgress"});
+                let diffs = items::file_diffs(&fake);
+                if let Some(mut fields) = items::tool_fields(&fake, false, Some(&diffs)) {
+                    if let Some(t) = self.threads.get_mut(&sid) {
+                        t.tools.insert(item.to_owned(), fields.clone());
+                    }
+                    fields["sessionUpdate"] = json!("tool_call_update");
+                    out.push(update(&sid, fields));
+                }
+            }
+            "turn/plan/updated" => {
+                let entries: Vec<Value> = p
+                    .get("plan")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .map(|step| {
+                        let status = match s(step, "status") {
+                            Some("completed") => "completed",
+                            Some("inProgress") => "in_progress",
+                            _ => "pending",
+                        };
+                        json!({"content": step.get("step"), "priority": "medium", "status": status})
+                    })
+                    .collect();
+                let mut u = json!({"sessionUpdate": "plan", "entries": entries});
+                if let Some(e) = p.get("explanation").filter(|e| e.is_string()) {
+                    u["_meta"] = json!({"codexAppServer": {"explanation": e}});
+                }
+                out.push(update(&sid, u));
+            }
+            "thread/tokenUsage/updated" => {
+                let usage = p.get("tokenUsage").cloned().unwrap_or(Value::Null);
+                let used = usage.pointer("/last/totalTokens").and_then(Value::as_u64).unwrap_or(0);
+                let size = usage.get("modelContextWindow").and_then(Value::as_u64).unwrap_or(0);
+                if let Some(t) = self.threads.get_mut(&sid) {
+                    t.usage = Some(usage.clone());
+                }
+                out.push(update(&sid, json!({"sessionUpdate": "usage_update", "used": used, "size": size, "_meta": {"codexAppServer": {"tokenUsage": usage}}})));
+            }
+            "thread/name/updated" => {
+                out.push(update(&sid, json!({"sessionUpdate": "session_info_update", "title": p.get("name").cloned().unwrap_or(Value::Null)})));
+            }
+            "model/rerouted" => {
+                if let (Some(t), Some(to)) = (self.threads.get_mut(&sid), s(p, "toModel")) {
+                    t.model = to.to_owned();
+                }
+                out.push(update(
+                    &sid,
+                    json!({"sessionUpdate": "config_option_update", "configOptions": self.config_options(&sid)}),
+                ));
+            }
+            "serverRequest/resolved" => {
+                // Answered or withdrawn on the server side (an interrupt): a
+                // late client answer has nothing to answer.
+                if let Some(rid) = p.get("requestId") {
+                    self.asked.retain(|_, a| a.server_id != *rid);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn turn_completed(&mut self, sid: &str, turn: &Value, out: &mut Vec<Out>) {
+        let Some(t) = self.threads.get_mut(sid) else { return };
+        let turn_id = s(turn, "id");
+        if t.turn.as_deref().is_some_and(|cur| Some(cur) != turn_id) {
+            return;
+        }
+        t.turn = None;
+        t.starting = false;
+        t.output.clear();
+        t.tools.clear();
+        t.streamed.clear();
+        let Some(prompt) = t.prompt.take() else { return };
+        let usage = usage_delta(t.usage_at_start.as_ref(), t.usage.as_ref());
+        match s(turn, "status") {
+            Some("failed") => {
+                let message = turn.pointer("/error/message").and_then(Value::as_str).unwrap_or("the turn failed");
+                let mut e = err(&prompt, INTERNAL, message);
+                e["error"]["data"] = json!({"codexErrorInfo": turn.pointer("/error/codexErrorInfo"), "additionalDetails": turn.pointer("/error/additionalDetails")});
+                out.push(Out::Client(e));
+            }
+            status => {
+                let stop = if status == Some("interrupted") { "cancelled" } else { "end_turn" };
+                let mut r = json!({"stopReason": stop, "_meta": {"codexAppServer": {"turnId": turn_id, "durationMs": turn.get("durationMs")}}});
+                if let Some(u) = usage {
+                    r["usage"] = u;
+                }
+                out.push(Out::Client(ok(&prompt, r)));
+            }
+        }
+    }
+
+    /// One item started or completed.
+    pub(super) fn item(&mut self, sid: &str, item: &Value, done: bool, out: &mut Vec<Out>) {
+        let Some(id) = s(item, "id").map(str::to_owned) else { return };
+        match s(item, "type").unwrap_or("") {
+            "userMessage" | "hookPrompt" | "functionCallOutput" | "enteredReviewMode" | "exitedReviewMode" => {}
+            "agentMessage" | "plan" => {
+                if !done {
+                    return;
+                }
+                let streamed = self.threads.get_mut(sid).is_some_and(|t| t.streamed.remove(&id));
+                if let Some(text) = s(item, "text").filter(|t| !t.is_empty() && !streamed) {
+                    out.push(update(sid, json!({"sessionUpdate": "agent_message_chunk", "messageId": id, "content": {"type": "text", "text": text}})));
+                }
+            }
+            "reasoning" => {
+                if !done {
+                    return;
+                }
+                let streamed = self.threads.get_mut(sid).is_some_and(|t| t.streamed.remove(&id));
+                let summary: Vec<&str> = item
+                    .get("summary")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
+                if !streamed && !summary.is_empty() {
+                    out.push(update(sid, json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": summary.join("\n\n")}})));
+                }
+            }
+            "subAgentActivity" => self.subagent_activity(sid, item, out),
+            kind => {
+                if kind == "collabAgentToolCall" {
+                    self.collab(sid, item, out);
+                }
+                self.tool_item(sid, &id, item, done, out);
+            }
+        }
+    }
+
+    fn tool_item(&mut self, sid: &str, id: &str, item: &Value, done: bool, out: &mut Vec<Out>) {
+        let Some(t) = self.threads.get_mut(sid) else { return };
+        if !done {
+            let diffs = (s(item, "type") == Some("fileChange")).then(|| items::file_diffs(item));
+            let Some(mut fields) = items::tool_fields(item, false, diffs.as_deref()) else { return };
+            t.tools.insert(id.to_owned(), fields.clone());
+            fields["sessionUpdate"] = json!("tool_call");
+            return out.push(update(sid, fields));
+        }
+        let started = t.tools.remove(id);
+        t.output.remove(id);
+        // The diffs computed at start: the file has changed since.
+        let diffs: Option<Vec<Value>> = started
+            .as_ref()
+            .and_then(|f| f.get("content"))
+            .and_then(Value::as_array)
+            .cloned()
+            .filter(|_| s(item, "type") == Some("fileChange"));
+        let diffs = diffs.or_else(|| (s(item, "type") == Some("fileChange")).then(|| items::file_diffs(item)));
+        let Some(mut fields) = items::tool_fields(item, true, diffs.as_deref()) else { return };
+        // A call nobody saw start (no item/started) still needs its call.
+        fields["sessionUpdate"] = json!(if started.is_some() { "tool_call_update" } else { "tool_call" });
+        out.push(update(sid, fields));
+    }
+
+    /// Subagent start and end from a `subAgentActivity` item (multi-agent
+    /// v2): the child thread's id is its ACP session id.
+    fn subagent_activity(&mut self, sid: &str, item: &Value, out: &mut Vec<Out>) {
+        let Some(child) = s(item, "agentThreadId").map(str::to_owned) else { return };
+        let path = s(item, "agentPath").unwrap_or("");
+        let name = path.rsplit('/').find(|p| !p.is_empty()).unwrap_or("agent").to_owned();
+        let state = match s(item, "kind") {
+            Some("completed") => "completed",
+            Some("interrupted") => "cancelled",
+            _ => "running",
+        };
+        let meta = json!({"codexAppServer": {"agentPath": path, "model": item.get("model"), "reasoningEffort": item.get("reasoningEffort")}});
+        self.subagent(sid, &child, &name, None, state, meta, None, out);
+    }
+
+    /// Subagents a collaboration call names (multi-agent v1 `spawnAgent`,
+    /// and agent states in later calls).
+    fn collab(&mut self, sid: &str, item: &Value, out: &mut Vec<Out>) {
+        let receivers: Vec<String> = item
+            .get("receiverThreadIds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect();
+        let spawn = s(item, "tool") == Some("spawnAgent");
+        for child in receivers {
+            let status = item.pointer(&format!("/agentsStates/{child}/status")).and_then(Value::as_str);
+            let state = match status {
+                Some("completed") => "completed",
+                Some("interrupted") => "cancelled",
+                Some("errored" | "shutdown" | "notFound") => "failed",
+                _ => "running",
+            };
+            if !spawn && !self.threads.contains_key(&child) {
+                continue;
+            }
+            let task = s(item, "prompt").map(str::to_owned);
+            let meta =
+                json!({"codexAppServer": {"model": item.get("model"), "reasoningEffort": item.get("reasoningEffort")}});
+            self.subagent(sid, &child, "agent", task, state, meta, s(item, "id"), out);
+        }
+    }
+
+    /// Records a subagent and reports its start or a change of its state,
+    /// once per change, under the parent's session.
+    #[allow(clippy::too_many_arguments)]
+    fn subagent(
+        &mut self,
+        parent: &str,
+        child: &str,
+        name: &str,
+        task: Option<String>,
+        state: &'static str,
+        meta: Value,
+        tool_call: Option<&str>,
+        out: &mut Vec<Out>,
+    ) {
+        let parent_model = self.threads.get(parent).map(|t| (t.mode.clone(), t.model.clone(), t.effort.clone()));
+        let fresh = !self.threads.contains_key(child);
+        let t = self.threads.entry(child.to_owned()).or_default();
+        if fresh {
+            t.parent = Some(parent.to_owned());
+            if let Some((mode, model, effort)) = parent_model {
+                t.mode = mode;
+                t.model = model;
+                t.effort = effort;
+            }
+            t.sub_state = Some("running");
+            let mut u = json!({
+                "sessionUpdate": "subagent_spawned",
+                "subagentSessionId": child,
+                "name": name,
+                "task": task.clone().unwrap_or_else(|| name.to_owned()),
+                "capabilities": {},
+                "_meta": meta,
+            });
+            if let Some(task) = task {
+                u["prompt"] = json!(task);
+            }
+            if let Some(call) = tool_call {
+                u["_meta"]["codexAppServer"]["toolCallId"] = json!(call);
+            }
+            out.push(update(parent, u));
+            if state == "running" {
+                return;
+            }
+        }
+        let t = self.threads.get_mut(child).expect("inserted above");
+        if t.sub_state == Some(state) {
+            return;
+        }
+        t.sub_state = Some(state);
+        out.push(update(
+            parent,
+            json!({"sessionUpdate": "subagent_state_update", "subagentSessionId": child, "state": state}),
+        ));
+    }
+
+    fn rate_limits(&mut self, p: &Value, out: &mut Vec<Out>) {
+        let Some(Value::Object(fresh)) = p.get("rateLimits") else { return };
+        let mut merged = self.rate_limits.clone().unwrap_or_else(|| json!({}));
+        if let Value::Object(m) = &mut merged {
+            for (k, v) in fresh {
+                if !v.is_null() {
+                    m.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        if self.rate_limits.as_ref() == Some(&merged) {
+            return;
+        }
+        self.rate_limits = Some(merged.clone());
+        for sid in self.roots() {
+            out.push(update(
+                &sid,
+                json!({"sessionUpdate": "session_info_update", "_meta": {"codexAppServer": {"rateLimits": merged}}}),
+            ));
+        }
+    }
+}
+
+/// Unix seconds as an RFC 3339 UTC time.
+pub(super) fn rfc3339(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+}
