@@ -137,4 +137,7 @@ measures cold start, first-token latency and memory of any ACP agent.
 
 ## License
 
+Copyright (c) 2026-present Manaflow, Inc. Other contributors and third
+parties retain copyright in their material.
+
 GPL-3.0-or-later. See [LICENSE](LICENSE).
