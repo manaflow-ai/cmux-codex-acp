@@ -356,6 +356,7 @@ impl State {
 pub(super) fn answer(asked: &Asked, decision: &Value) -> Value {
     match &asked.shape {
         Shape::Decision => json!({"decision": decision}),
+        Shape::Whole => decision.clone(),
         Shape::Permissions { asked: profile } => match decision.as_str() {
             Some("session") => json!({"permissions": profile, "scope": "session"}),
             Some("turn") => json!({"permissions": profile, "scope": "turn"}),

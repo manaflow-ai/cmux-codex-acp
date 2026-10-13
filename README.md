@@ -107,7 +107,7 @@ Server requests:
 | `item/fileChange/requestApproval` | `session/request_permission` with the diff |
 | `item/permissions/requestApproval` | `session/request_permission`: grant for the turn, for the session, or deny |
 | `item/tool/requestUserInput` | one question with choices: `session/request_permission` with one option per choice; otherwise answered empty |
-| `mcpServer/elicitation/request` | declined (ACP has no elicitation form yet) |
+| `mcpServer/elicitation/request` | an MCP tool approval (`codex_approval_kind: mcp_tool_call`): `session/request_permission` (allow, allow for the session, always allow, deny); other forms are declined (ACP has no elicitation form yet) |
 | others (`item/tool/call`, `account/chatgptAuthTokens/refresh`, `attestation/generate`, legacy v1 approvals) | method-not-found error |
 
 Not mapped, by design: thread management outside a session (archive,

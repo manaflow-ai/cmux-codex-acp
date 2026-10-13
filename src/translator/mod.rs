@@ -114,6 +114,8 @@ enum Shape {
     Question {
         question_id: String,
     },
+    /// The decision is the whole answer (an MCP tool approval elicitation).
+    Whole,
 }
 
 /// One Codex thread: an ACP session, or a subagent of one.

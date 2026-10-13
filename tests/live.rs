@@ -295,3 +295,52 @@ fn model_switch_applies_to_the_next_turn() {
     }
     a.close();
 }
+
+#[test]
+fn an_mcp_tool_call_asks_in_ask_mode() {
+    let Some(l) = live("mcp") else { return };
+    let marker = l.dir.join("marker.txt");
+    let server = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/marker_mcp.py");
+    let mut a = Agent::spawn(&l.argv, &[], &l.dir);
+    a.initialize();
+    let id = a.request(
+        "session/new",
+        json!({"cwd": l.dir, "mcpServers": [{
+            "name": "marker", "command": "python3", "args": [server],
+            "env": [{"name": "MARKER_FILE", "value": marker}],
+        }]}),
+    );
+    let sid = a.result(id, TURN)["sessionId"].as_str().unwrap().to_owned();
+    set_mode(&mut a, &sid, "ask");
+    a.policy = pick("reject_once");
+    let (r, from) = a.prompt(
+        &sid,
+        "Call the write_marker tool of the marker MCP server once with the text hello. If it is refused, reply refused and stop.",
+        TURN,
+    );
+    let _ = stop_reason(&r);
+    let asked: Vec<Value> = a.log[from..]
+        .iter()
+        .filter(|(_, m)| m["method"] == "session/request_permission")
+        .map(|(_, m)| m["params"].clone())
+        .collect();
+    let called = a.updates(from, &sid).iter().any(|u| u["_meta"]["codexAppServer"]["itemType"] == "mcpToolCall");
+    assert!(called, "the model never called the MCP tool");
+    assert!(!asked.is_empty(), "an MCP tool call in ask mode ran without a permission request");
+    assert!(!marker.exists(), "the denied MCP tool call ran");
+    // Allowed, it runs.
+    a.policy = pick("allow_once");
+    let (r, from) =
+        a.prompt(&sid, "Call the write_marker tool of the marker MCP server once with the text hello.", TURN);
+    assert_eq!(stop_reason(&r), "end_turn");
+    assert!(
+        a.log[from..].iter().any(|(_, m)| m["method"] == "session/request_permission"),
+        "the second MCP tool call ran without a permission request"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).ok().as_deref(),
+        Some("hello"),
+        "the allowed MCP tool call did not run"
+    );
+    a.close();
+}

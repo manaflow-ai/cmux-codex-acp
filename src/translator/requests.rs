@@ -153,6 +153,61 @@ impl State {
                 });
                 self.ask_with(&thread, id, call, options, json!(""), Shape::Question { question_id: qid }, out);
             }
+            // Codex asks before an MCP tool call (approval policies that ask) as a form
+            // elicitation marked `codex_approval_kind: mcp_tool_call`; accept runs the tool,
+            // `_meta.persist` keeps the approval for the session or always.
+            "mcpServer/elicitation/request"
+                if known
+                    && p.pointer("/_meta/codex_approval_kind").and_then(Value::as_str) == Some("mcp_tool_call") =>
+            {
+                let server = s(p, "serverName").unwrap_or("mcp");
+                let running = self.threads.get(&thread).and_then(|t| {
+                    t.tools
+                        .values()
+                        .filter(|f| {
+                            f.pointer("/_meta/codexAppServer/itemType").and_then(Value::as_str) == Some("mcpToolCall")
+                        })
+                        .find(|f| f["title"].as_str().is_some_and(|title| title.starts_with(&format!("{server}: "))))
+                        .cloned()
+                });
+                let mut call = running.unwrap_or_else(|| {
+                    json!({"toolCallId": format!("mcp-approval-{id}"), "kind": "other", "title": format!("{server}: tool")})
+                });
+                if let Some(o) = call.as_object_mut() {
+                    o.remove("sessionUpdate");
+                }
+                call["rawInput"] = p.pointer("/_meta/tool_params").cloned().unwrap_or(Value::Null);
+                call["content"] =
+                    json!([{"type": "content", "content": {"type": "text", "text": s(p, "message").unwrap_or("")}}]);
+                let persist: Vec<&str> = p
+                    .pointer("/_meta/persist")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
+                let mut options = vec![(
+                    json!({"optionId": "accept", "name": "Allow", "kind": "allow_once"}),
+                    json!({"action": "accept"}),
+                )];
+                if persist.contains(&"session") {
+                    options.push((
+                        json!({"optionId": "acceptForSession", "name": "Allow for this session", "kind": "allow_always"}),
+                        json!({"action": "accept", "_meta": {"persist": "session"}}),
+                    ));
+                }
+                if persist.contains(&"always") {
+                    options.push((
+                        json!({"optionId": "acceptAlways", "name": "Always allow this tool", "kind": "allow_always"}),
+                        json!({"action": "accept", "_meta": {"persist": "always"}}),
+                    ));
+                }
+                options.push((
+                    json!({"optionId": "decline", "name": "Deny", "kind": "reject_once"}),
+                    json!({"action": "decline"}),
+                ));
+                self.ask_with(&thread, id, call, options, json!({"action": "cancel"}), Shape::Whole, out);
+            }
             "mcpServer/elicitation/request" => {
                 out.push(Out::Server(ok(&id, json!({"action": "decline"}))));
             }
