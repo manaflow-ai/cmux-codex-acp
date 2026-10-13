@@ -55,6 +55,10 @@ impl State {
                     let command = s(p, "command").unwrap_or("");
                     json!({"toolCallId": item, "kind": "execute", "title": items::shell_script(command), "rawInput": {"command": items::shell_script(command), "cwd": p.get("cwd")}})
                 });
+                // What is asked is running a command, whatever Codex's parse
+                // of it shows (a "read" label must not let a client policy that
+                // approves reads approve a shell command).
+                call["kind"] = json!("execute");
                 if let Some(reason) = s(p, "reason") {
                     call["content"] = json!([{"type": "content", "content": {"type": "text", "text": reason}}]);
                 }
