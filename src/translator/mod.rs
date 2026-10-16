@@ -32,6 +32,9 @@ pub struct Options {
     pub model: Option<String>,
     /// The reasoning effort a new session starts with.
     pub effort: Option<String>,
+    /// Advertise and translate one-shot ACP audio input. This is opt-in because
+    /// older Codex app-server versions reject the `audio` input variant.
+    pub audio_input: bool,
 }
 
 impl Default for Options {
@@ -43,6 +46,7 @@ impl Default for Options {
             default_mode: config::DEFAULT_MODE.into(),
             model: None,
             effort: None,
+            audio_input: false,
         }
     }
 }
@@ -402,5 +406,48 @@ impl State {
         t.model = model;
         t.effort = effort;
         Some(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn advertised_audio(audio_input: bool) -> bool {
+        let translator = Translator::new(Options { audio_input, ..Options::default() });
+        let server_initialize = translator.start();
+        let server_id = match &server_initialize[0] {
+            Out::Server(message) => message["id"].clone(),
+            other => panic!("expected app-server initialize, got {other:?}"),
+        };
+        translator.from_server(&json!({
+            "jsonrpc": "2.0",
+            "id": server_id,
+            "result": {"userAgent": "codex-test"},
+        }));
+        let client_initialize = translator.from_client(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": 1},
+        }));
+        let result = client_initialize
+            .into_iter()
+            .find_map(|message| match message {
+                Out::Client(message) => message.get("result").cloned(),
+                Out::Server(_) => None,
+            })
+            .expect("ACP initialize result");
+        result["agentCapabilities"]["promptCapabilities"]["audio"].as_bool().expect("audio capability bool")
+    }
+
+    #[test]
+    fn initialize_does_not_advertise_audio_by_default() {
+        assert!(!advertised_audio(false));
+    }
+
+    #[test]
+    fn initialize_advertises_audio_when_explicitly_enabled() {
+        assert!(advertised_audio(true));
     }
 }

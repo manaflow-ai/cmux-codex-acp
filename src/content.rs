@@ -35,9 +35,10 @@ fn text(t: String) -> Value {
 ///
 /// Text stays text. An image goes in as a data URL (or its URI). A file
 /// link becomes an `@path` mention in the text, as Codex's own composer
-/// writes it; embedded file contents are quoted inline with their path, so
-/// the model sees what the client attached.
-pub fn user_input(blocks: &[Value]) -> Vec<Value> {
+/// writes it. Audio is forwarded as a data URL only when `audio_input` is
+/// enabled. Embedded file contents are quoted inline with their path, so the
+/// model sees what the client attached.
+pub fn user_input(blocks: &[Value], audio_input: bool) -> Vec<Value> {
     let mut out = Vec::new();
     for b in blocks {
         let s = |k: &str| b.get(k).and_then(Value::as_str);
@@ -56,6 +57,19 @@ pub fn user_input(blocks: &[Value]) -> Vec<Value> {
                 } else {
                     out.push(json!({"type": "image", "url": url}));
                 }
+            }
+            Some("audio") => {
+                if !audio_input {
+                    continue;
+                }
+                let url = match (s("data"), s("uri")) {
+                    (Some(data), _) => {
+                        format!("data:{};base64,{data}", s("mimeType").unwrap_or("audio/wav"))
+                    }
+                    (None, Some(uri)) => uri.to_owned(),
+                    _ => continue,
+                };
+                out.push(json!({"type": "audio", "url": url}));
             }
             Some("resource_link") => {
                 out.push(text(format!("@{}", shown(s("uri").unwrap_or("")))));
@@ -93,4 +107,34 @@ pub fn acp_blocks(content: &Value) -> Vec<Value> {
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_data_becomes_a_codex_data_url() {
+        let input = user_input(
+            &[json!({
+                "type": "audio",
+                "mimeType": "audio/wav",
+                "data": "AQID",
+            })],
+            true,
+        );
+        assert_eq!(input, vec![json!({"type": "audio", "url": "data:audio/wav;base64,AQID"})]);
+    }
+
+    #[test]
+    fn audio_uri_is_forwarded() {
+        let input = user_input(&[json!({"type": "audio", "uri": "https://example.test/clip.wav"})], true);
+        assert_eq!(input, vec![json!({"type": "audio", "url": "https://example.test/clip.wav"})]);
+    }
+
+    #[test]
+    fn audio_is_dropped_when_disabled() {
+        let input = user_input(&[json!({"type": "audio", "data": "AQID"})], false);
+        assert!(input.is_empty());
+    }
 }
