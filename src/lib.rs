@@ -36,6 +36,10 @@ pub const CODEX_TESTED_VERSION: &str = "0.162.1";
 /// The prefix of the error a steered prompt gets when no turn is running.
 /// A client that steers can tell it apart and send the prompt as a new turn.
 pub const STEER_NO_TURN: &str = "steer: no turn is running";
+/// A prompt that is only audio, for a model that does not take audio input.
+pub const AUDIO_NOT_TAKEN: &str = "this model does not take voice input";
+/// Sent to the client when a prompt's audio is dropped for such a model.
+pub const AUDIO_DROPPED: &str = "This model can't take voice; sent text only.";
 
 /// Whether an app-server line is a streaming delta: frequent, small, and
 /// carried again in the translated update. A caller that logs raw lines may

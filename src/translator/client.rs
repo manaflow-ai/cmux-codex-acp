@@ -270,14 +270,26 @@ impl State {
             return out.push(Out::Client(err(&id, INVALID_PARAMS, "sessionId is required")));
         };
         let blocks: Vec<Value> = p.get("prompt").and_then(Value::as_array).cloned().unwrap_or_default();
-        // A prompt that is only audio keeps it even for a model that cannot hear
-        // it: Codex says so, where dropping it would send an empty turn.
-        let audio_only = blocks.iter().all(|b| b.get("type").and_then(Value::as_str) == Some("audio"));
-        let input = content::user_input(&blocks, self.thread_takes_audio(&sid) || (audio_only && self.audio_input()));
+        let takes_audio = self.thread_takes_audio(&sid);
+        let input = content::user_input(&blocks, takes_audio);
         let steer = p.pointer("/_meta/steer").and_then(Value::as_bool) == Some(true);
         let Some(t) = self.threads.get(&sid) else {
             return out.push(Out::Client(err(&id, INVALID_PARAMS, format!("unknown session {sid}"))));
         };
+        // Audio for a model that does not take it is dropped. A prompt left
+        // with nothing else is refused, and otherwise the client hears why the
+        // turn went out as text alone.
+        let is_audio = |b: &Value| b.get("type").and_then(Value::as_str) == Some("audio");
+        if !takes_audio && blocks.iter().any(is_audio) {
+            if blocks.iter().all(is_audio) {
+                return out.push(Out::Client(err(&id, INVALID_PARAMS, crate::AUDIO_NOT_TAKEN)));
+            }
+            out.push(update(
+                &sid,
+                json!({"sessionUpdate": "agent_message_chunk", "messageId": format!("audio-dropped-{id}"),
+                    "content": {"type": "text", "text": crate::AUDIO_DROPPED}}),
+            ));
+        }
         if steer {
             match (t.turn.clone(), t.starting) {
                 (Some(turn), _) => {
