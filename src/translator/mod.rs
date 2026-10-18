@@ -358,6 +358,23 @@ impl State {
         json!(format!("codex-{id}"))
     }
 
+    /// Whether a prompt to `thread` may carry audio: the app-server takes it
+    /// and so does the thread's model (the default model for a thread that
+    /// has none yet). A model `model/list` names takes audio only when its
+    /// `inputModalities` list `audio` (an empty or missing list takes none),
+    /// since Codex would only tell any other model it could not hear it. A
+    /// model the list does not name (hidden, or the list has not arrived) is
+    /// left to Codex.
+    pub(super) fn thread_takes_audio(&self, thread: &str) -> bool {
+        let model = self.model_of(thread);
+        self.audio_input()
+            && self
+                .models
+                .iter()
+                .find(|m| if model.is_empty() { m.is_default } else { m.id == model })
+                .is_none_or(config::ModelInfo::takes_audio)
+    }
+
     fn model_of(&self, thread: &str) -> String {
         self.threads.get(thread).map(|t| t.model.clone()).unwrap_or_default()
     }
@@ -482,5 +499,171 @@ mod tests {
         assert!(!advertised_audio(true, "acpmux/0.144.9 (Mac OS 27.0.1; arm64)"));
         assert!(!advertised_audio(true, "codex-test"));
         assert!(!advertised_audio(true, "acpmux/main (Mac OS 27.0.1; arm64)"));
+    }
+
+    /// A translator past `initialize` and `model/list` from an app-server at
+    /// `CURRENT` whose only model, the default, takes `modalities`.
+    fn with_default_model(modalities: &[&str]) -> Translator {
+        let translator = Translator::new(Options { audio_input: true, ..Options::default() });
+        let id = |outs: Vec<Out>| {
+            outs.into_iter()
+                .find_map(|o| match o {
+                    Out::Server(m) if m.get("method").is_some() && m.get("id").is_some() => Some(m["id"].clone()),
+                    _ => None,
+                })
+                .expect("an app-server request")
+        };
+        let init = id(translator.start());
+        let list = id(translator.from_server(&json!({"jsonrpc": "2.0", "id": init, "result": {"userAgent": CURRENT}})));
+        translator.from_server(&json!({"jsonrpc": "2.0", "id": list, "result": {"data": [{
+            "id": "m", "displayName": "M", "isDefault": true, "inputModalities": modalities,
+        }]}}));
+        translator
+    }
+
+    #[test]
+    fn audio_goes_only_to_a_model_that_hears_it() {
+        let text_only = with_default_model(&["text", "image"]);
+        assert!(!text_only.state.lock().unwrap().thread_takes_audio("new"));
+        let hears = with_default_model(&["text", "audio"]);
+        assert!(hears.state.lock().unwrap().thread_takes_audio("new"));
+    }
+
+    #[test]
+    fn a_thread_is_judged_by_its_own_model() {
+        let translator = with_default_model(&["text", "audio"]);
+        let mut state = translator.state.lock().unwrap();
+        state.threads.insert("t".into(), Thread { model: "m".into(), ..Thread::default() });
+        assert!(state.thread_takes_audio("t"));
+        // A model the list does not name (hidden, or rerouted to) is left to Codex.
+        state.threads.get_mut("t").unwrap().model = "hidden".into();
+        assert!(state.thread_takes_audio("t"));
+        drop(state);
+        let translator = with_default_model(&["text"]);
+        let mut state = translator.state.lock().unwrap();
+        state.threads.insert("t".into(), Thread { model: "m".into(), ..Thread::default() });
+        assert!(!state.thread_takes_audio("t"));
+    }
+
+    /// `with_default_model` plus a second model, `other`, taking `other_modalities`.
+    fn with_two_models(modalities: &[&str], other_modalities: Option<&[&str]>) -> Translator {
+        let translator = Translator::new(Options { audio_input: true, ..Options::default() });
+        let id = |outs: Vec<Out>| {
+            outs.into_iter()
+                .find_map(|o| match o {
+                    Out::Server(m) if m.get("method").is_some() && m.get("id").is_some() => Some(m["id"].clone()),
+                    _ => None,
+                })
+                .expect("an app-server request")
+        };
+        let init = id(translator.start());
+        let list = id(translator.from_server(&json!({"jsonrpc": "2.0", "id": init, "result": {"userAgent": CURRENT}})));
+        let mut other = json!({"id": "other", "displayName": "Other"});
+        if let Some(m) = other_modalities {
+            other["inputModalities"] = json!(m);
+        }
+        translator.from_server(&json!({"jsonrpc": "2.0", "id": list, "result": {"data": [
+            {"id": "m", "displayName": "M", "isDefault": true, "inputModalities": modalities},
+            other,
+        ]}}));
+        translator.state.lock().unwrap().threads.insert("t".into(), Thread::default());
+        translator
+    }
+
+    /// What a `session/prompt` of `blocks` to thread `t` sends: the
+    /// `turn/start` input, or the error, and any notices to the client.
+    fn prompt(translator: &Translator, blocks: Value) -> (Result<Value, Value>, Vec<Value>) {
+        let outs = translator.from_client(&json!({"jsonrpc": "2.0", "id": 7, "method": "session/prompt",
+            "params": {"sessionId": "t", "prompt": blocks}}));
+        let mut result = Err(Value::Null);
+        let mut notices = Vec::new();
+        for o in outs {
+            match o {
+                Out::Server(m) if m["method"] == "turn/start" => result = Ok(m["params"]["input"].clone()),
+                Out::Client(m) if m.get("error").is_some() => result = Err(m["error"]["message"].clone()),
+                Out::Client(m) if m["method"] == "session/update" => notices.push(m["params"]["update"].clone()),
+                _ => {}
+            }
+        }
+        // Ready for the next prompt.
+        let mut state = translator.state.lock().unwrap();
+        let t = state.threads.get_mut("t").expect("thread t");
+        (t.starting, t.prompt) = (false, None);
+        (result, notices)
+    }
+
+    const VOICE: &str = "UklGRg==";
+
+    fn text_and_audio() -> Value {
+        json!([{"type": "text", "text": "fix the build"}, {"type": "audio", "mimeType": "audio/wav", "data": VOICE}])
+    }
+
+    #[test]
+    fn a_prompt_with_voice_carries_it_to_a_model_that_hears_it() {
+        let translator = with_two_models(&["text", "audio"], None);
+        let (input, notices) = prompt(&translator, text_and_audio());
+        let input = input.expect("turn/start");
+        assert_eq!(input[1], json!({"type": "audio", "url": format!("data:audio/wav;base64,{VOICE}")}));
+        assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn a_prompt_with_voice_goes_as_text_with_a_notice_to_a_model_that_does_not() {
+        let translator = with_two_models(&["text", "image"], None);
+        let (input, notices) = prompt(&translator, text_and_audio());
+        let input = input.expect("turn/start");
+        assert_eq!(input.as_array().map(Vec::len), Some(1));
+        assert_eq!(input[0]["type"], "text");
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0]["content"]["text"], crate::AUDIO_DROPPED);
+    }
+
+    #[test]
+    fn a_rejected_prompt_gives_no_notice() {
+        let translator = with_two_models(&["text"], None);
+        translator.state.lock().unwrap().threads.get_mut("t").unwrap().starting = true;
+        let outs = translator.from_client(&json!({"jsonrpc": "2.0", "id": 7, "method": "session/prompt",
+            "params": {"sessionId": "t", "prompt": text_and_audio()}}));
+        assert!(outs.iter().all(|o| !matches!(o, Out::Client(m) if m["method"] == "session/update")));
+        let outs = translator.from_client(&json!({"jsonrpc": "2.0", "id": 8, "method": "session/prompt",
+            "params": {"sessionId": "t", "prompt": text_and_audio(), "_meta": {"steer": true}}}));
+        assert_eq!(outs.iter().filter(|o| matches!(o, Out::Client(m) if m["method"] == "session/update")).count(), 1);
+        translator.state.lock().unwrap().threads.get_mut("t").unwrap().starting = false;
+        let outs = translator.from_client(&json!({"jsonrpc": "2.0", "id": 9, "method": "session/prompt",
+            "params": {"sessionId": "t", "prompt": text_and_audio(), "_meta": {"steer": true}}}));
+        assert!(outs.iter().all(|o| !matches!(o, Out::Client(m) if m["method"] == "session/update")));
+    }
+
+    #[test]
+    fn a_voice_only_prompt_to_a_model_that_does_not_hear_it_is_refused() {
+        let translator = with_two_models(&["text"], None);
+        let (input, _) = prompt(&translator, json!([{"type": "audio", "mimeType": "audio/wav", "data": VOICE}]));
+        assert_eq!(input, Err(json!(crate::AUDIO_NOT_TAKEN)));
+    }
+
+    #[test]
+    fn switching_models_switches_whether_voice_goes() {
+        // `other` names no modalities: Codex's own default, no audio.
+        let translator = with_two_models(&["text", "audio"], None);
+        assert!(prompt(&translator, text_and_audio()).1.is_empty());
+        translator.from_client(&json!({"jsonrpc": "2.0", "id": 8, "method": "session/set_config_option",
+            "params": {"sessionId": "t", "configId": "model", "value": "other"}}));
+        assert_eq!(prompt(&translator, text_and_audio()).1.len(), 1);
+        let translator = with_two_models(&["text"], Some(&["text", "audio"]));
+        translator.from_client(&json!({"jsonrpc": "2.0", "id": 8, "method": "session/set_config_option",
+            "params": {"sessionId": "t", "configId": "model", "value": "other"}}));
+        assert!(prompt(&translator, text_and_audio()).1.is_empty());
+    }
+
+    #[test]
+    fn model_options_name_their_input_modalities() {
+        let models = config::parse_models(&json!({"data": [
+            {"id": "a", "inputModalities": ["text", "audio"]},
+            {"id": "b"},
+        ]}));
+        let options = config::config_options(&models, "a", config::DEFAULT_EFFORT, config::DEFAULT_MODE);
+        let model = &options[0]["options"];
+        assert_eq!(model[0]["_meta"]["inputModalities"], json!(["text", "audio"]));
+        assert!(model[1].get("_meta").is_none());
     }
 }

@@ -83,6 +83,17 @@ pub struct ModelInfo {
     pub description: String,
     pub efforts: Vec<(String, String)>,
     pub is_default: bool,
+    /// What the model takes as input (`inputModalities`: `text`, `image`,
+    /// `audio`); empty when the app-server does not say.
+    pub input_modalities: Vec<String>,
+}
+
+impl ModelInfo {
+    /// Whether the model hears audio input. Codex replaces audio with an
+    /// "unsupported media" note for any model that does not list it.
+    pub fn takes_audio(&self) -> bool {
+        self.input_modalities.iter().any(|m| m == "audio")
+    }
 }
 
 pub fn parse_models(result: &Value) -> Vec<ModelInfo> {
@@ -105,6 +116,13 @@ pub fn parse_models(result: &Value) -> Vec<ModelInfo> {
                 .filter_map(|e| Some((e.get("reasoningEffort")?.as_str()?.to_owned(), s(e, "description"))))
                 .collect(),
             is_default: m.get("isDefault").and_then(Value::as_bool).unwrap_or(false),
+            input_modalities: m
+                .get("inputModalities")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect(),
         })
         .collect()
 }
@@ -125,8 +143,18 @@ fn effort_name(id: &str) -> String {
 
 /// The config options of one session: model, reasoning effort, mode.
 pub fn config_options(models: &[ModelInfo], model: &str, effort: &str, mode: &str) -> Value {
-    let mut model_opts: Vec<Value> =
-        models.iter().map(|m| json!({"value": m.id, "name": m.name, "description": m.description})).collect();
+    // Each option names its input modalities, so a client can tell which
+    // models hear the audio `promptCapabilities.audio` lets it send.
+    let mut model_opts: Vec<Value> = models
+        .iter()
+        .map(|m| {
+            let mut opt = json!({"value": m.id, "name": m.name, "description": m.description});
+            if !m.input_modalities.is_empty() {
+                opt["_meta"] = json!({"inputModalities": m.input_modalities});
+            }
+            opt
+        })
+        .collect();
     if !model.is_empty() && !models.iter().any(|m| m.id == model) {
         model_opts.insert(0, json!({"value": model, "name": model}));
     }
