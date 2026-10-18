@@ -270,7 +270,10 @@ impl State {
             return out.push(Out::Client(err(&id, INVALID_PARAMS, "sessionId is required")));
         };
         let blocks: Vec<Value> = p.get("prompt").and_then(Value::as_array).cloned().unwrap_or_default();
-        let input = content::user_input(&blocks, self.thread_takes_audio(&sid));
+        // A prompt that is only audio keeps it even for a model that cannot hear
+        // it: Codex says so, where dropping it would send an empty turn.
+        let audio_only = blocks.iter().all(|b| b.get("type").and_then(Value::as_str) == Some("audio"));
+        let input = content::user_input(&blocks, self.thread_takes_audio(&sid) || (audio_only && self.audio_input()));
         let steer = p.pointer("/_meta/steer").and_then(Value::as_bool) == Some(true);
         let Some(t) = self.threads.get(&sid) else {
             return out.push(Out::Client(err(&id, INVALID_PARAMS, format!("unknown session {sid}"))));

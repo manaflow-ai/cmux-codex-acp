@@ -360,8 +360,10 @@ impl State {
 
     /// Whether a prompt to `thread` may carry audio: the app-server takes it
     /// and so does the thread's model (the default model for a thread that
-    /// has none yet). Audio for any other model is dropped, since Codex would
-    /// only tell the model it could not hear it.
+    /// has none yet). Audio for a listed model without the audio modality is
+    /// dropped, since Codex would only tell the model it could not hear it; a
+    /// model `model/list` does not name (hidden, or the list has not arrived)
+    /// is left to Codex.
     pub(super) fn thread_takes_audio(&self, thread: &str) -> bool {
         let model = self.model_of(thread);
         self.audio_input()
@@ -369,7 +371,7 @@ impl State {
                 .models
                 .iter()
                 .find(|m| if model.is_empty() { m.is_default } else { m.id == model })
-                .is_some_and(config::ModelInfo::takes_audio)
+                .is_none_or(config::ModelInfo::takes_audio)
     }
 
     fn model_of(&self, thread: &str) -> String {
@@ -524,6 +526,22 @@ mod tests {
         assert!(!text_only.state.lock().unwrap().thread_takes_audio("new"));
         let hears = with_default_model(&["text", "audio"]);
         assert!(hears.state.lock().unwrap().thread_takes_audio("new"));
+    }
+
+    #[test]
+    fn a_thread_is_judged_by_its_own_model() {
+        let translator = with_default_model(&["text", "audio"]);
+        let mut state = translator.state.lock().unwrap();
+        state.threads.insert("t".into(), Thread { model: "m".into(), ..Thread::default() });
+        assert!(state.thread_takes_audio("t"));
+        // A model the list does not name (hidden, or rerouted to) is left to Codex.
+        state.threads.get_mut("t").unwrap().model = "hidden".into();
+        assert!(state.thread_takes_audio("t"));
+        drop(state);
+        let translator = with_default_model(&["text"]);
+        let mut state = translator.state.lock().unwrap();
+        state.threads.insert("t".into(), Thread { model: "m".into(), ..Thread::default() });
+        assert!(!state.thread_takes_audio("t"));
     }
 
     #[test]
