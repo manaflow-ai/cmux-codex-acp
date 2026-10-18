@@ -42,7 +42,7 @@ impl State {
             "protocolVersion": 1,
             "agentCapabilities": {
                 "loadSession": true,
-                "promptCapabilities": {"image": true, "audio": false, "embeddedContext": true},
+                "promptCapabilities": {"image": true, "audio": self.opts.audio_input, "embeddedContext": true},
                 "mcpCapabilities": {"http": true, "sse": false},
                 "sessionCapabilities": {"fork": {}, "resume": {}, "list": {}, "close": {}},
             },
@@ -270,7 +270,7 @@ impl State {
             return out.push(Out::Client(err(&id, INVALID_PARAMS, "sessionId is required")));
         };
         let blocks: Vec<Value> = p.get("prompt").and_then(Value::as_array).cloned().unwrap_or_default();
-        let input = content::user_input(&blocks);
+        let input = content::user_input(&blocks, self.opts.audio_input);
         let steer = p.pointer("/_meta/steer").and_then(Value::as_bool) == Some(true);
         let Some(t) = self.threads.get(&sid) else {
             return out.push(Out::Client(err(&id, INVALID_PARAMS, format!("unknown session {sid}"))));
