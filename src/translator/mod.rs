@@ -358,6 +358,20 @@ impl State {
         json!(format!("codex-{id}"))
     }
 
+    /// Whether a prompt to `thread` may carry audio: the app-server takes it
+    /// and so does the thread's model (the default model for a thread that
+    /// has none yet). Audio for any other model is dropped, since Codex would
+    /// only tell the model it could not hear it.
+    pub(super) fn thread_takes_audio(&self, thread: &str) -> bool {
+        let model = self.model_of(thread);
+        self.audio_input()
+            && self
+                .models
+                .iter()
+                .find(|m| if model.is_empty() { m.is_default } else { m.id == model })
+                .is_some_and(config::ModelInfo::takes_audio)
+    }
+
     fn model_of(&self, thread: &str) -> String {
         self.threads.get(thread).map(|t| t.model.clone()).unwrap_or_default()
     }
@@ -482,5 +496,45 @@ mod tests {
         assert!(!advertised_audio(true, "acpmux/0.144.9 (Mac OS 27.0.1; arm64)"));
         assert!(!advertised_audio(true, "codex-test"));
         assert!(!advertised_audio(true, "acpmux/main (Mac OS 27.0.1; arm64)"));
+    }
+
+    /// A translator past `initialize` and `model/list` from an app-server at
+    /// `CURRENT` whose only model, the default, takes `modalities`.
+    fn with_default_model(modalities: &[&str]) -> Translator {
+        let translator = Translator::new(Options { audio_input: true, ..Options::default() });
+        let id = |outs: Vec<Out>| {
+            outs.into_iter()
+                .find_map(|o| match o {
+                    Out::Server(m) if m.get("method").is_some() && m.get("id").is_some() => Some(m["id"].clone()),
+                    _ => None,
+                })
+                .expect("an app-server request")
+        };
+        let init = id(translator.start());
+        let list = id(translator.from_server(&json!({"jsonrpc": "2.0", "id": init, "result": {"userAgent": CURRENT}})));
+        translator.from_server(&json!({"jsonrpc": "2.0", "id": list, "result": {"data": [{
+            "id": "m", "displayName": "M", "isDefault": true, "inputModalities": modalities,
+        }]}}));
+        translator
+    }
+
+    #[test]
+    fn audio_goes_only_to_a_model_that_hears_it() {
+        let text_only = with_default_model(&["text", "image"]);
+        assert!(!text_only.state.lock().unwrap().thread_takes_audio("new"));
+        let hears = with_default_model(&["text", "audio"]);
+        assert!(hears.state.lock().unwrap().thread_takes_audio("new"));
+    }
+
+    #[test]
+    fn model_options_name_their_input_modalities() {
+        let models = config::parse_models(&json!({"data": [
+            {"id": "a", "inputModalities": ["text", "audio"]},
+            {"id": "b"},
+        ]}));
+        let options = config::config_options(&models, "a", config::DEFAULT_EFFORT, config::DEFAULT_MODE);
+        let model = &options[0]["options"];
+        assert_eq!(model[0]["_meta"]["inputModalities"], json!(["text", "audio"]));
+        assert!(model[1].get("_meta").is_none());
     }
 }

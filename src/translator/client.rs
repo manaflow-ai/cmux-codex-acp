@@ -270,7 +270,7 @@ impl State {
             return out.push(Out::Client(err(&id, INVALID_PARAMS, "sessionId is required")));
         };
         let blocks: Vec<Value> = p.get("prompt").and_then(Value::as_array).cloned().unwrap_or_default();
-        let input = content::user_input(&blocks, self.audio_input());
+        let input = content::user_input(&blocks, self.thread_takes_audio(&sid));
         let steer = p.pointer("/_meta/steer").and_then(Value::as_bool) == Some(true);
         let Some(t) = self.threads.get(&sid) else {
             return out.push(Out::Client(err(&id, INVALID_PARAMS, format!("unknown session {sid}"))));
