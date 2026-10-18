@@ -32,8 +32,10 @@ pub struct Options {
     pub model: Option<String>,
     /// The reasoning effort a new session starts with.
     pub effort: Option<String>,
-    /// Advertise and translate one-shot ACP audio input. This is opt-in because
-    /// older Codex app-server versions reject the `audio` input variant.
+    /// Advertise and translate one-shot ACP audio input. This is opt-in, and
+    /// it applies only to an app-server whose `userAgent` names a version at
+    /// or after [`AUDIO_INPUT_VERSION`]: older ones reject the `audio` input
+    /// variant, so an unknown version gets none.
     pub audio_input: bool,
 }
 
@@ -176,6 +178,27 @@ struct State {
     threads: HashMap<String, Thread>,
     rate_limits: Option<Value>,
     user_agent: Option<String>,
+}
+
+/// The first Codex app-server whose `turn/start` takes `{"type": "audio"}` input.
+pub const AUDIO_INPUT_VERSION: (u64, u64, u64) = (0, 145, 0);
+
+/// The version in an app-server `userAgent` (`<originator>/<x.y.z>[-pre] (os; arch) ...`).
+fn agent_version(user_agent: &str) -> Option<(u64, u64, u64)> {
+    let (_, version) = user_agent.split_whitespace().next()?.split_once('/')?;
+    let core = version.split(['-', '+']).next()?;
+    let mut parts = core.split('.').map(|p| p.parse::<u64>().ok());
+    let version = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(version)
+}
+
+impl State {
+    /// Whether this app-server takes audio input: the caller opted in and the
+    /// server's version is known to accept it.
+    pub(super) fn audio_input(&self) -> bool {
+        self.opts.audio_input
+            && self.user_agent.as_deref().and_then(agent_version).is_some_and(|v| v >= AUDIO_INPUT_VERSION)
+    }
 }
 
 /// The Codex app-server <-> ACP translator. Every method takes `&self`;
@@ -413,7 +436,9 @@ impl State {
 mod tests {
     use super::*;
 
-    fn advertised_audio(audio_input: bool) -> bool {
+    const CURRENT: &str = "acpmux/0.163.0 (Mac OS 27.0.1; arm64) unknown (acpmux; 1)";
+
+    fn advertised_audio(audio_input: bool, user_agent: &str) -> bool {
         let translator = Translator::new(Options { audio_input, ..Options::default() });
         let server_initialize = translator.start();
         let server_id = match &server_initialize[0] {
@@ -423,7 +448,7 @@ mod tests {
         translator.from_server(&json!({
             "jsonrpc": "2.0",
             "id": server_id,
-            "result": {"userAgent": "codex-test"},
+            "result": {"userAgent": user_agent},
         }));
         let client_initialize = translator.from_client(&json!({
             "jsonrpc": "2.0",
@@ -443,11 +468,19 @@ mod tests {
 
     #[test]
     fn initialize_does_not_advertise_audio_by_default() {
-        assert!(!advertised_audio(false));
+        assert!(!advertised_audio(false, CURRENT));
     }
 
     #[test]
     fn initialize_advertises_audio_when_explicitly_enabled() {
-        assert!(advertised_audio(true));
+        assert!(advertised_audio(true, CURRENT));
+        assert!(advertised_audio(true, "codex_cli_rs/0.145.0-alpha.2 (Linux; x86_64)"));
+    }
+
+    #[test]
+    fn initialize_does_not_advertise_audio_to_an_older_or_unknown_server() {
+        assert!(!advertised_audio(true, "acpmux/0.144.9 (Mac OS 27.0.1; arm64)"));
+        assert!(!advertised_audio(true, "codex-test"));
+        assert!(!advertised_audio(true, "acpmux/main (Mac OS 27.0.1; arm64)"));
     }
 }
