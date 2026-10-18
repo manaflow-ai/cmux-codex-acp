@@ -277,27 +277,33 @@ impl State {
             return out.push(Out::Client(err(&id, INVALID_PARAMS, format!("unknown session {sid}"))));
         };
         // Audio for a model that does not take it is dropped. A prompt left
-        // with nothing else is refused, and otherwise the client hears why the
-        // turn went out as text alone.
+        // with nothing else is refused, and a prompt that is accepted tells the
+        // client why it went out as text alone (a rejected one says nothing,
+        // so its retry does not repeat the notice).
         let is_audio = |b: &Value| b.get("type").and_then(Value::as_str) == Some("audio");
-        if !takes_audio && blocks.iter().any(is_audio) {
-            if blocks.iter().all(is_audio) {
-                return out.push(Out::Client(err(&id, INVALID_PARAMS, crate::AUDIO_NOT_TAKEN)));
-            }
-            out.push(update(
+        let dropped = !takes_audio && blocks.iter().any(is_audio);
+        if dropped && blocks.iter().all(is_audio) {
+            return out.push(Out::Client(err(&id, INVALID_PARAMS, crate::AUDIO_NOT_TAKEN)));
+        }
+        let notice = dropped.then(|| {
+            update(
                 &sid,
                 json!({"sessionUpdate": "agent_message_chunk", "messageId": format!("audio-dropped-{id}"),
                     "content": {"type": "text", "text": crate::AUDIO_DROPPED}}),
-            ));
-        }
+            )
+        });
         if steer {
             match (t.turn.clone(), t.starting) {
                 (Some(turn), _) => {
+                    out.extend(notice);
                     let params = json!({"threadId": sid, "expectedTurnId": turn, "input": input});
                     out.push(self.send(Pending::TurnSteer { client: id }, "turn/steer", params));
                 }
                 // The turn has no id yet: steer it once it has one.
-                (None, true) => self.threads.get_mut(&sid).expect("checked above").queued_steers.push((id, input)),
+                (None, true) => {
+                    out.extend(notice);
+                    self.threads.get_mut(&sid).expect("checked above").queued_steers.push((id, input));
+                }
                 (None, false) => out.push(Out::Client(err(&id, INTERNAL, crate::STEER_NO_TURN))),
             }
             return;
@@ -305,6 +311,7 @@ impl State {
         if t.turn.is_some() || t.starting {
             return out.push(Out::Client(err(&id, INTERNAL, "a turn is already running in this session")));
         }
+        out.extend(notice);
         let mut params = json!({"threadId": sid, "input": input});
         // Approval and sandbox only when the mode changed: the app-server
         // keeps them per thread, and a sandbox policy sent every turn would

@@ -619,6 +619,22 @@ mod tests {
     }
 
     #[test]
+    fn a_rejected_prompt_gives_no_notice() {
+        let translator = with_two_models(&["text"], None);
+        translator.state.lock().unwrap().threads.get_mut("t").unwrap().starting = true;
+        let outs = translator.from_client(&json!({"jsonrpc": "2.0", "id": 7, "method": "session/prompt",
+            "params": {"sessionId": "t", "prompt": text_and_audio()}}));
+        assert!(outs.iter().all(|o| !matches!(o, Out::Client(m) if m["method"] == "session/update")));
+        let outs = translator.from_client(&json!({"jsonrpc": "2.0", "id": 8, "method": "session/prompt",
+            "params": {"sessionId": "t", "prompt": text_and_audio(), "_meta": {"steer": true}}}));
+        assert_eq!(outs.iter().filter(|o| matches!(o, Out::Client(m) if m["method"] == "session/update")).count(), 1);
+        translator.state.lock().unwrap().threads.get_mut("t").unwrap().starting = false;
+        let outs = translator.from_client(&json!({"jsonrpc": "2.0", "id": 9, "method": "session/prompt",
+            "params": {"sessionId": "t", "prompt": text_and_audio(), "_meta": {"steer": true}}}));
+        assert!(outs.iter().all(|o| !matches!(o, Out::Client(m) if m["method"] == "session/update")));
+    }
+
+    #[test]
     fn a_voice_only_prompt_to_a_model_that_does_not_hear_it_is_refused() {
         let translator = with_two_models(&["text"], None);
         let (input, _) = prompt(&translator, json!([{"type": "audio", "mimeType": "audio/wav", "data": VOICE}]));
