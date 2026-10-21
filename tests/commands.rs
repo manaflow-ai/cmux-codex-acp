@@ -64,6 +64,8 @@ fn slash_commands_match_the_node_adapter() {
         "rejected plan mode: turn runs in": ["collaborationMode=None"],
         "goal already complete": "end_turn",
         "close while an approved plan waits: answers": ["cancelled"],
+        "hidden context: titles": ["hello titled", "Greeting from the oracle"],
+        "hidden context: reaches the title model": false,
     });
     assert_eq!(robust, &want, "cancel, exit and refusal paths");
     let _ = std::fs::remove_dir_all(&project);

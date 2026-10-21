@@ -114,23 +114,38 @@ pub(super) fn parse(blocks: &[Value]) -> Option<(String, String)> {
     Some((name.to_lowercase(), rest.to_owned()))
 }
 
+/// Whether a block is a client's hidden context, not the person's words: a
+/// block marked `_meta.acpmux.context` (acpmux), or text that is one
+/// `<…-context>` element (the app's `<cmux-workspace-context>`, also as Codex
+/// stores it). A title never comes from it.
+fn is_client_context(block: &Value) -> bool {
+    if block.pointer("/_meta/acpmux/context").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    let text = block.get("text").and_then(Value::as_str).unwrap_or("").trim_start();
+    text.strip_prefix('<')
+        .and_then(|rest| rest.split_once('>'))
+        .is_some_and(|(name, _)| name.ends_with("-context") && !name.contains(char::is_whitespace))
+}
+
+/// The text blocks of a prompt that are the person's words.
+fn person_text(blocks: &[Value]) -> Vec<&str> {
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text") && !is_client_context(b))
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect()
+}
+
 /// A prompt's text, whitespace collapsed: the fallback title.
 pub(super) fn title_of(blocks: &[Value]) -> Option<String> {
-    let text: Vec<&str> = blocks
-        .iter()
-        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|b| b.get("text").and_then(Value::as_str))
-        .collect();
+    let text = person_text(blocks);
     normalize(&text.join(" "))
 }
 
 /// A prompt's text blocks joined by spaces, trimmed (the title thread's input).
 pub(super) fn raw_text(blocks: &[Value]) -> Option<String> {
-    let text: Vec<&str> = blocks
-        .iter()
-        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|b| b.get("text").and_then(Value::as_str))
-        .collect();
+    let text = person_text(blocks);
     let t = text.join(" ").trim().to_owned();
     (!t.is_empty()).then_some(t)
 }

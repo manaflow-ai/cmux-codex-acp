@@ -155,7 +155,7 @@ if "--robustness" in opts:
     rob["rejected plan mode: /plan"] = "error" if st["error"] else st["stop"]
     rob["rejected plan mode: next turn's mode"] = [c for c in st["calls"] if c.startswith("turn/start ")] or None
     st = step(w, ws, "hello after")
-    rob["rejected plan mode: turn runs in"] = [c.split(" ")[1] for c in st["calls"] if c.startswith("turn/start ")]
+    rob["rejected plan mode: turn runs in"] = [c.split(" ")[1] for c in st["calls"] if c.startswith("turn/start ") and "generate a very short title" not in c]
     w.close()
     env.pop("FIX_REJECT_SETTINGS", None)
     v = Agent()
@@ -182,6 +182,20 @@ if "--robustness" in opts:
     rob["close while an approved plan waits: answers"] = answers
     u.close()
     env.pop("FIX_HOLD_SETTINGS", None)
+    q = Agent()
+    q.wait(q.req("initialize", {"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "oracle", "version": "1"}}))
+    qs = q.wait(q.req("session/new", {"cwd": os.getcwd(), "mcpServers": []}))["result"]["sessionId"]
+    f0 = len(fixture_lines())
+    i = q.req("session/prompt", {"sessionId": qs, "prompt": [
+        {"type": "text", "text": "hello  titled"},
+        {"type": "text", "text": "<cmux-workspace-context>secret pane list</cmux-workspace-context>", "_meta": {"acpmux": {"context": True}}}]})
+    q.wait(i)
+    q.until(lambda m: m.get("method") == "session/update" and m["params"]["update"].get("title") == "Greeting from the oracle")
+    titles = [m["params"]["update"]["title"] for m in q.log if m.get("method") == "session/update" and "title" in m["params"]["update"]]
+    title_inputs = [l for l in fixture_lines()[f0:] if "generate a very short title" in l]
+    rob["hidden context: titles"] = titles
+    rob["hidden context: reaches the title model"] = any("secret pane list" in l for l in title_inputs)
+    q.close()
     res["robust"] = rob
 # The project folder differs per run: write it as <cwd>.
 text = json.dumps(res, indent=1).replace(json.dumps(os.getcwd())[1:-1], "<cwd>")
