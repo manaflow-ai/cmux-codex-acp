@@ -114,23 +114,39 @@ pub(super) fn parse(blocks: &[Value]) -> Option<(String, String)> {
     Some((name.to_lowercase(), rest.to_owned()))
 }
 
+/// Whether a block is a client's hidden context, not the person's words: a
+/// block marked `_meta.acpmux.context` (acpmux), or text that starts with a
+/// `<cmux-…-context>` tag (the app's `<cmux-workspace-context>`, also as
+/// Codex stores it). The same rule as acpmux's `prompt_context::is_context_text`.
+/// A title never comes from it.
+fn is_client_context(block: &Value) -> bool {
+    if block.pointer("/_meta/acpmux/context").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    let text = block.get("text").and_then(Value::as_str).unwrap_or("").trim_start();
+    text.strip_prefix("<cmux-")
+        .and_then(|rest| rest.split_once('>'))
+        .is_some_and(|(name, _)| name.ends_with("-context") && !name.contains(char::is_whitespace))
+}
+
+/// The text blocks of a prompt that are the person's words.
+fn person_text(blocks: &[Value]) -> Vec<&str> {
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text") && !is_client_context(b))
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect()
+}
+
 /// A prompt's text, whitespace collapsed: the fallback title.
 pub(super) fn title_of(blocks: &[Value]) -> Option<String> {
-    let text: Vec<&str> = blocks
-        .iter()
-        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|b| b.get("text").and_then(Value::as_str))
-        .collect();
+    let text = person_text(blocks);
     normalize(&text.join(" "))
 }
 
 /// A prompt's text blocks joined by spaces, trimmed (the title thread's input).
 pub(super) fn raw_text(blocks: &[Value]) -> Option<String> {
-    let text: Vec<&str> = blocks
-        .iter()
-        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|b| b.get("text").and_then(Value::as_str))
-        .collect();
+    let text = person_text(blocks);
     let t = text.join(" ").trim().to_owned();
     (!t.is_empty()).then_some(t)
 }
@@ -897,8 +913,9 @@ impl State {
         if t.title_generated || matches!(t.title, TitleSource::Explicit | TitleSource::Unknown) {
             return;
         }
-        t.title_generated = true;
+        // A prompt with no words of the person's (only context) keeps the one try.
         let Some(text) = text.filter(|t| !t.trim().is_empty()) else { return };
+        t.title_generated = true;
         let cwd = t.cwd.clone();
         let mut params = json!({"ephemeral": true});
         if !cwd.is_empty() {
