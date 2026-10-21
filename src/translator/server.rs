@@ -78,6 +78,7 @@ impl State {
                 if let Some(t) = self.threads.get_mut(&thread) {
                     t.prompt = None;
                     t.starting = false;
+                    t.command_turn = false;
                     // The overrides may not have reached Codex: send them again.
                     t.applied_mode.clear();
                     for (steer, _) in t.queued_steers.drain(..) {
@@ -151,7 +152,9 @@ impl State {
                 } else if let Some(t) = self.threads.get_mut(&sid) {
                     // Resumed without its history: its title stays the client's,
                     // unless the thread has a name of its own.
-                    t.title = commands::TitleSource::Unknown;
+                    if t.title == commands::TitleSource::Unset {
+                        t.title = commands::TitleSource::Unknown;
+                    }
                     if let Some(name) =
                         r.pointer("/thread/name").and_then(Value::as_str).filter(|n| !n.trim().is_empty())
                     {
@@ -241,6 +244,13 @@ impl State {
             // A subagent thread whose parent this translator presents.
             "thread/started" => return self.thread_started(p.get("thread").unwrap_or(&Value::Null), out),
             _ if !known && self.title_line(method, p, out) => return,
+            // Skills changed on disk (no thread): every session's `$skill` list again.
+            "skills/changed" => {
+                for sid in self.roots() {
+                    self.publish_commands(&sid, out);
+                }
+                return;
+            }
             _ if !known => return,
             _ => {}
         }
@@ -253,10 +263,22 @@ impl State {
                     t.turn = Some(turn.to_owned());
                     t.starting = false;
                     // A command's turn (`/compact`, `/goal`) gets its id only
-                    // here: a cancel that came before it stops it now.
-                    if t.command_turn && std::mem::take(&mut t.cancel_pending) {
-                        let params = json!({"threadId": sid, "turnId": turn});
-                        out.push(self.send(Pending::Ignore, "turn/interrupt", params));
+                    // here: a cancel that came before it stops it now, and steers
+                    // that came before it reach it now.
+                    if t.command_turn {
+                        let steers = std::mem::take(&mut t.queued_steers);
+                        if std::mem::take(&mut t.cancel_pending) {
+                            for (steer, _) in steers {
+                                out.push(Out::Client(err(&steer, INTERNAL, crate::STEER_NO_TURN)));
+                            }
+                            let params = json!({"threadId": sid, "turnId": turn});
+                            out.push(self.send(Pending::Ignore, "turn/interrupt", params));
+                        } else {
+                            for (steer, input) in steers {
+                                let params = json!({"threadId": sid, "expectedTurnId": turn, "input": input});
+                                out.push(self.send(Pending::TurnSteer { client: steer }, "turn/steer", params));
+                            }
+                        }
                     }
                 }
             }
@@ -264,7 +286,19 @@ impl State {
                 out.push(update(sid, json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "*Context compacted to fit the model's context window.*\n\n"}})));
                 self.compacted(sid, out);
             }
-            "skills/changed" => self.publish_commands(sid, out),
+            "thread/settings/updated" => {
+                let mode = p.pointer("/threadSettings/collaborationMode/mode").and_then(Value::as_str);
+                if let (Some(t), Some(mode)) = (self.threads.get_mut(sid), mode)
+                    && !t.collab_pending
+                    && t.collab.as_deref() != Some(mode)
+                {
+                    t.collab = Some(mode.to_owned());
+                    out.push(update(
+                        sid,
+                        json!({"sessionUpdate": "config_option_update", "configOptions": self.config_options(sid)}),
+                    ));
+                }
+            }
             "thread/goal/updated" => {
                 out.push(update(
                     sid,

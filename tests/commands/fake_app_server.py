@@ -4,7 +4,10 @@
 Same fixture for every adapter under test, so the adapter is the only
 variable. Env: FIX_DELTAS (agent message deltas, default 4000), FIX_REASON
 (reasoning deltas, 200), FIX_OUT (command output deltas, 200), FIX_LOG
-(file that gets each method the adapter sent).
+(file that gets each method the adapter sent, command params, the approval
+decision and the delta count), FIX_TEXT (file that gets the whole agent
+message). Command methods (skills, mcp, review, compact, goal, rename,
+logout, settings, title thread) answer as codex 0.162 does.
 A prompt with "cancel-me" streams 10 deltas, then waits for turn/interrupt.
 No sleeps: it only reacts to what it reads.
 """
@@ -147,12 +150,16 @@ def turn(rid, params):
         d = WORDS[i % len(WORDS)] + " "; full.append(d)
         ev("item/agentMessage/delta", threadId=th, turnId=tid, itemId="m1", delta=d)
     ev("item/completed", threadId=th, turnId=tid, item={"type": "agentMessage", "id": "m1", "text": "".join(full)})
+    # Written before the turn ends, so a client that saw the end can read them.
+    if LOG:
+        LOG.write("approval-decision %s\nagent-deltas %d\n" % (decision, n_msg)); LOG.flush()
+    if os.environ.get("FIX_TEXT"):
+        with open(os.environ["FIX_TEXT"], "w") as f: f.write("".join(full))
     ev("thread/tokenUsage/updated", threadId=th, turnId=tid, tokenUsage={
         "total": {"totalTokens": N + 100, "inputTokens": 100, "cachedInputTokens": 0, "outputTokens": n_msg, "reasoningOutputTokens": NR},
         "last": {"totalTokens": N + 100, "inputTokens": 100, "cachedInputTokens": 0, "outputTokens": N, "reasoningOutputTokens": NR},
         "modelContextWindow": 400000})
     ev("turn/completed", threadId=th, turn=dict(tobj, status="completed"))
-    if LOG: LOG.write("approval-decision %s\n" % decision); LOG.flush()
 
 while True:
     m = read()
@@ -177,6 +184,8 @@ while True:
             {"name": "triage", "description": "Triage a bug report", "path": "/s/triage/SKILL.md", "scope": "repo", "enabled": True}], "errors": []}]}})
     elif meth == "mcpServerStatus/list":
         send({"id": rid, "result": {"data": [{"name": "docs", "tools": {"search": {}, "fetch": {}}, "resources": [{"uri": "x"}], "resourceTemplates": [], "authStatus": "unsupported"}], "nextCursor": None}})
+    elif meth == "thread/name/set" and p.get("name") == "die":
+        sys.exit(1)
     elif meth == "thread/name/set":
         send({"id": rid, "result": {}})
         ev("thread/name/updated", threadId=p.get("threadId"), threadName=p.get("name"))
@@ -194,7 +203,7 @@ while True:
         goal = {"threadId": th, "objective": p.get("objective") or "Ship it", "status": p.get("status") or "active", "tokenBudget": None, "tokensUsed": 0, "timeUsedSeconds": 0, "createdAt": 1, "updatedAt": 1}
         send({"id": rid, "result": {"goal": goal}})
         ev("thread/goal/updated", threadId=th, turnId=None, goal=goal)
-        if goal["status"] == "active":
+        if goal["status"] == "active" and "no-turn" not in (p.get("objective") or ""):
             tid, tobj = command_turn(th, "goal")
             run_command_turn(th, tid, tobj, [("say", "Working toward the goal.")])
     elif meth == "thread/goal/clear":
@@ -215,6 +224,8 @@ while True:
         r = ts_result(cwd); r["thread"] = thread(cwd, hist)
         if meth == "thread/read": r = {"thread": r["thread"]}
         send({"id": rid, "result": r})
+    elif meth == "thread/settings/update" and os.environ.get("FIX_REJECT_SETTINGS"):
+        send({"id": rid, "error": {"code": -32600, "message": "thread/settings/update requires experimentalApi"}})
     elif meth == "thread/settings/update":
         if p.get("collaborationMode"): STATE["collab"] = p["collaborationMode"].get("mode")
         send({"id": rid, "result": {}})

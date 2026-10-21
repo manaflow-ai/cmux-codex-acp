@@ -185,6 +185,8 @@ struct Thread {
     plan_review: Option<(Value, String)>,
     /// A `/goal pause` or `/goal clear` prompt, answered with the goal's update.
     goal_prompt: Option<Value>,
+    /// A collaboration mode change waits for Codex.
+    collab_pending: bool,
     /// The title was generated (or asked for) once.
     title_generated: bool,
     /// The running prompt's text, for the title thread.
@@ -330,6 +332,14 @@ impl Translator {
         for id in st.waiting_init.drain(..) {
             out.push(Out::Client(err(&id, INTERNAL, &message)));
         }
+        // Each waiting client request is answered once, even when two records
+        // hold it (a turn's `TurnStart` and its thread's prompt).
+        let mut answered = HashSet::new();
+        let mut fail = |id: &Value, out: &mut Vec<Out>| {
+            if !id.is_null() && answered.insert(key(id)) {
+                out.push(Out::Client(err(id, INTERNAL, &message)));
+            }
+        };
         let pending: Vec<Pending> = st.pending.drain().map(|(_, p)| p).collect();
         for p in pending {
             match p {
@@ -339,20 +349,27 @@ impl Translator {
                 | Pending::ThreadList { client }
                 | Pending::TurnSteer { client }
                 | Pending::Ack { client }
-                | Pending::TurnStart { client, .. } => out.push(Out::Client(err(&client, INTERNAL, &message))),
+                | Pending::Command { client, .. }
+                | Pending::TurnStart { client, .. } => fail(&client, &mut out),
                 _ => {}
             }
         }
         for t in st.threads.values_mut() {
-            if let Some(id) = t.prompt.take() {
-                out.push(Out::Client(err(&id, INTERNAL, &message)));
+            if let Some((ask, _)) = t.plan_review.take() {
+                out.push(Out::Client(notification("$/cancel_request", json!({"requestId": ask}))));
+            }
+            for id in t.prompt.take().into_iter().chain(t.goal_prompt.take()) {
+                fail(&id, &mut out);
             }
             for (id, _) in t.queued_steers.drain(..) {
-                out.push(Out::Client(err(&id, INTERNAL, &message)));
+                fail(&id, &mut out);
             }
             t.turn = None;
             t.starting = false;
+            t.compacting = false;
+            t.command_turn = false;
         }
+        st.title_threads.clear();
         let queued: Vec<Value> = std::mem::take(&mut st.queued);
         for m in queued {
             if let Some(id) = m.get("id").filter(|_| m.get("method").is_some()) {

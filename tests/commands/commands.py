@@ -129,6 +129,35 @@ ups = [m["params"]["update"] for m in y.log[l0:] if m.get("method") == "session/
 res["load_titles"] = [u.get("title") for u in ups if u.get("sessionUpdate") == "session_info_update" and "title" in u]
 y.close()
 res["steps"] = steps
+if "--robustness" in opts:
+    # Not compared with the node adapter (it waits 1 s on a timer and sends a
+    # continuation prompt where this ends at once): asserted by the caller.
+    rob = {}
+    z = Agent()
+    z.wait(z.req("initialize", {"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "oracle", "version": "1"}}))
+    zs = z.wait(z.req("session/new", {"cwd": os.getcwd(), "mcpServers": []}))["result"]["sessionId"]
+    i = z.req("session/prompt", {"sessionId": zs, "prompt": [{"type": "text", "text": "/goal no-turn objective"}]})
+    z.until(lambda m: m.get("method") == "session/update" and "goal" in (m["params"]["update"].get("_meta") or {}))
+    z.send({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": zs}})
+    rob["goal without a turn, then cancel"] = (z.wait(i).get("result") or {}).get("stopReason")
+    rob["next prompt after it"] = step(z, zs, "/skills")["stop"]
+    i = z.req("session/prompt", {"sessionId": zs, "prompt": [{"type": "text", "text": "/rename die"}]})
+    r = z.wait(i)
+    rob["app-server exits during /rename"] = "error" if "error" in r else (r.get("result") or {}).get("stopReason")
+    z.close()
+    env["FIX_REJECT_SETTINGS"] = "1"
+    w = Agent()
+    w.wait(w.req("initialize", {"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "oracle", "version": "1"}}))
+    ws = w.wait(w.req("session/new", {"cwd": os.getcwd(), "mcpServers": []}))["result"]["sessionId"]
+    r = w.wait(w.req("session/set_config_option", {"sessionId": ws, "configId": "collaboration_mode", "value": "plan"}))
+    rob["rejected plan mode: set_config_option"] = "error" if "error" in r else "ok"
+    st = step(w, ws, "/plan")
+    rob["rejected plan mode: /plan"] = "error" if st["error"] else st["stop"]
+    rob["rejected plan mode: next turn's mode"] = [c for c in st["calls"] if c.startswith("turn/start ")] or None
+    st = step(w, ws, "hello after")
+    rob["rejected plan mode: turn runs in"] = [c.split(" ")[1] for c in st["calls"] if c.startswith("turn/start ")]
+    w.close()
+    res["robust"] = rob
 # The project folder differs per run: write it as <cwd>.
 text = json.dumps(res, indent=1).replace(json.dumps(os.getcwd())[1:-1], "<cwd>")
 open(out_path, "w").write(text)

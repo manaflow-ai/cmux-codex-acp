@@ -73,6 +73,29 @@ pub(super) enum CommandWait {
     /// `thread/start` of the ephemeral title thread for this session; the
     /// prompt text rides along.
     TitleThread(String),
+    /// The title thread's `turn/start` (this title thread).
+    TitleTurn(String),
+    /// `thread/settings/update` of the collaboration mode; what follows once Codex took it.
+    Collab {
+        previous: Option<String>,
+        then: CollabThen,
+    },
+}
+
+/// The `thread` field of a title thread's own requests: the title thread.
+fn sid_of_title(title_thread: &str) -> String {
+    title_thread.to_owned()
+}
+
+/// What a collaboration mode change does once Codex took it.
+#[derive(Debug, Clone)]
+pub(super) enum CollabThen {
+    /// `/plan`: the prompt ends.
+    Prompt,
+    /// `session/set_config_option`: its answer.
+    Config,
+    /// An approved plan: the prompt runs the implementation turn.
+    Implement,
 }
 
 /// `/<name> rest` from a prompt's first block; None for a plain prompt or `$skill`.
@@ -249,10 +272,18 @@ impl State {
     }
 
     /// Sets the session's collaboration mode on the thread (`thread/settings/update`,
-    /// as the adapter does): it holds for later turns and other clients.
-    pub(super) fn set_collaboration(&mut self, sid: &str, mode: &str, out: &mut Vec<Out>) {
-        let Some(t) = self.threads.get_mut(sid) else { return };
-        t.collab = Some(mode.to_owned());
+    /// as the adapter does): it holds for later turns and other clients. The
+    /// session shows it, and `then` runs, only once Codex took it.
+    pub(super) fn set_collaboration(
+        &mut self,
+        sid: &str,
+        mode: &str,
+        client: Value,
+        then: CollabThen,
+        out: &mut Vec<Out>,
+    ) {
+        let Some(t) = self.threads.get(sid) else { return };
+        let previous = t.collab.clone();
         let model = t.model.clone();
         // The effort the model runs at: the session's pick, else the model's default.
         let effort = if t.effort.is_empty() || t.effort == config::DEFAULT_EFFORT {
@@ -262,7 +293,65 @@ impl State {
         };
         let params = json!({"threadId": sid, "collaborationMode": {"mode": mode,
             "settings": {"model": model, "reasoning_effort": effort, "developer_instructions": null}}});
-        out.push(self.send(Pending::Ignore, "thread/settings/update", params));
+        if let Some(t) = self.threads.get_mut(sid) {
+            t.collab = Some(mode.to_owned());
+            t.collab_pending = true;
+        }
+        let pending = Pending::Command { client, thread: sid.to_owned(), wait: CommandWait::Collab { previous, then } };
+        out.push(self.send(pending, "thread/settings/update", params));
+    }
+
+    /// Codex took (or refused) a collaboration mode change.
+    fn collab_done(
+        &mut self,
+        client: Value,
+        sid: &str,
+        previous: Option<String>,
+        then: CollabThen,
+        error: Option<(i64, String)>,
+        out: &mut Vec<Out>,
+    ) {
+        let Some(t) = self.threads.get_mut(sid) else {
+            if !client.is_null() {
+                out.push(Out::Client(err(&client, INVALID_PARAMS, format!("unknown session {sid}"))));
+            }
+            return;
+        };
+        t.collab_pending = false;
+        if let Some((code, message)) = error {
+            t.collab = previous;
+            if matches!(then, CollabThen::Implement) {
+                t.prompt = None;
+                t.starting = false;
+            }
+            if !client.is_null() {
+                out.push(Out::Client(err(&client, code, message)));
+            }
+            return;
+        }
+        let options = self.config_options(sid);
+        match then {
+            CollabThen::Prompt => {
+                out.push(update(sid, json!({"sessionUpdate": "config_option_update", "configOptions": options})));
+                if !client.is_null() {
+                    out.push(Out::Client(ok(&client, json!({"stopReason": "end_turn"}))));
+                }
+            }
+            CollabThen::Config => {
+                if !client.is_null() {
+                    out.push(Out::Client(ok(&client, json!({"configOptions": options}))));
+                }
+            }
+            CollabThen::Implement => {
+                out.push(update(sid, json!({"sessionUpdate": "config_option_update", "configOptions": options})));
+                if client.is_null() {
+                    return;
+                }
+                let params =
+                    json!({"threadId": sid, "input": [{"type": "text", "text": IMPLEMENT_PLAN, "text_elements": []}]});
+                out.push(self.send(Pending::TurnStart { client, thread: sid.to_owned() }, "turn/start", params));
+            }
+        }
     }
 
     /// Runs `/<name> rest` for the prompt `id`. False: not a command; the prompt is a turn.
@@ -284,12 +373,7 @@ impl State {
                 }
                 let Some(t) = self.threads.get(sid) else { return false };
                 let next = if t.collab.as_deref() == Some(PLAN) { DEFAULT_COLLABORATION } else { PLAN };
-                self.set_collaboration(sid, next, out);
-                out.push(update(
-                    sid,
-                    json!({"sessionUpdate": "config_option_update", "configOptions": self.config_options(sid)}),
-                ));
-                done(out);
+                self.set_collaboration(sid, next, id.clone(), CollabThen::Prompt, out);
             }
             "compact" => {
                 self.begin_command_turn(id, sid);
@@ -378,9 +462,26 @@ impl State {
         r: &Value,
         out: &mut Vec<Out>,
     ) {
+        // A prompt cancelled or closed while its request ran was answered then.
+        if client.is_null()
+            && matches!(
+                wait,
+                CommandWait::Done
+                    | CommandWait::Skills
+                    | CommandWait::Mcp
+                    | CommandWait::Logout
+                    | CommandWait::StatusAccount
+                    | CommandWait::StatusLimits
+                    | CommandWait::GoalUpdate
+            )
+        {
+            return;
+        }
         let done = |out: &mut Vec<Out>| out.push(Out::Client(ok(&client, json!({"stopReason": "end_turn"}))));
         match wait {
             CommandWait::Done => done(out),
+            CommandWait::Collab { previous, then } => self.collab_done(client, &sid, previous, then, None, out),
+            CommandWait::TitleTurn(_) => {}
             CommandWait::Publish => {
                 if self.threads.contains_key(&sid) {
                     let commands = Self::command_list(r);
@@ -456,8 +557,23 @@ impl State {
                 out.push(say(&sid, &text));
                 done(out);
             }
-            CommandWait::Compact | CommandWait::GoalActive => {
-                // The turn the app-server starts for it answers the prompt.
+            CommandWait::Compact => {
+                // The compaction turn answers the prompt.
+            }
+            CommandWait::GoalActive => {
+                // An active goal starts a turn, which answers the prompt; a goal
+                // that did not become active (complete, budget limited) starts none.
+                let active = r.pointer("/goal/status").and_then(Value::as_str).is_none_or(|s| s == "active");
+                if !active
+                    && let Some(t) = self.threads.get_mut(&sid)
+                    && t.turn.is_none()
+                {
+                    t.starting = false;
+                    t.command_turn = false;
+                    if let Some(prompt) = t.prompt.take() {
+                        out.push(Out::Client(ok(&prompt, json!({"stopReason": "end_turn"}))));
+                    }
+                }
             }
             CommandWait::TitleThread(text) => {
                 let Some(title_thread) = r.pointer("/thread/id").and_then(Value::as_str) else { return };
@@ -466,7 +582,12 @@ impl State {
                 let params = json!({"threadId": title_thread, "input": [{"type": "text", "text": input, "text_elements": []}],
                     "outputSchema": {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"], "additionalProperties": false},
                     "model": TITLE_MODEL});
-                out.push(self.send(Pending::Ignore, "turn/start", params));
+                let pending = Pending::Command {
+                    client: Value::Null,
+                    thread: sid_of_title(title_thread),
+                    wait: CommandWait::TitleTurn(title_thread.to_owned()),
+                };
+                out.push(self.send(pending, "turn/start", params));
             }
             CommandWait::GoalUpdate => {
                 // Nothing changed (`cleared: false`): no update will come.
@@ -477,6 +598,43 @@ impl State {
                     Some(t) => t.goal_prompt = Some(client),
                     None => done(out),
                 }
+            }
+        }
+    }
+
+    /// `session/cancel` or `session/close` for `sid`: every prompt that waits on a
+    /// command (a request, a goal update, a command turn not started yet) ends
+    /// now with `reason`; a command turn that starts later is interrupted.
+    pub(super) fn end_command_prompts(&mut self, sid: &str, reason: &str, out: &mut Vec<Out>) {
+        let answer = |id: &Value, out: &mut Vec<Out>| out.push(Out::Client(ok(id, json!({"stopReason": reason}))));
+        for p in self.pending.values_mut() {
+            if let Pending::Command { client, thread, wait } = p
+                && thread == sid
+                && !client.is_null()
+                && !matches!(wait, CommandWait::Collab { .. } | CommandWait::Compact | CommandWait::GoalActive)
+            {
+                answer(client, out);
+                *client = Value::Null;
+            }
+        }
+        let Some(t) = self.threads.get_mut(sid) else { return };
+        if let Some(id) = t.goal_prompt.take() {
+            answer(&id, out);
+        }
+        if t.command_turn && t.turn.is_none() {
+            t.cancel_pending = true;
+            t.starting = false;
+            t.compacting = false;
+            if let Some(id) = t.prompt.take() {
+                answer(&id, out);
+            }
+        }
+        // The prompt's Command request (compact, goal) is answered: its reply finds no client.
+        for p in self.pending.values_mut() {
+            if let Pending::Command { client, thread, wait: CommandWait::Compact | CommandWait::GoalActive } = p
+                && thread == sid
+            {
+                *client = Value::Null;
             }
         }
     }
@@ -509,8 +667,10 @@ impl State {
                 }
             }
             // The status shows what is known.
-            CommandWait::StatusAccount => self.command_result(client, sid, CommandWait::StatusAccount, &json!({}), out),
-            CommandWait::StatusLimits => {
+            CommandWait::StatusAccount if !client.is_null() => {
+                self.command_result(client, sid, CommandWait::StatusAccount, &json!({}), out)
+            }
+            CommandWait::StatusLimits if !client.is_null() => {
                 let text = self.status_text(&sid, None);
                 out.push(say(&sid, &text));
                 out.push(Out::Client(ok(&client, json!({"stopReason": "end_turn"}))));
@@ -522,9 +682,18 @@ impl State {
                     t.compacting = false;
                     t.command_turn = false;
                 }
-                out.push(Out::Client(err(&client, code, message)));
+                if !client.is_null() {
+                    out.push(Out::Client(err(&client, code, message)));
+                }
             }
             CommandWait::TitleThread(_) => {}
+            CommandWait::TitleTurn(title_thread) => {
+                self.title_threads.remove(&title_thread);
+            }
+            CommandWait::Collab { previous, then } => {
+                self.collab_done(client, &sid, previous, then, Some((code, message)), out)
+            }
+            _ if client.is_null() => {}
             _ => out.push(Out::Client(err(&client, code, message))),
         }
     }
@@ -669,17 +838,13 @@ impl State {
         if !approved {
             t.prompt = None;
             out.push(Out::Client(ok(&prompt, json!({"stopReason": "end_turn"}))));
+            let text = t.prompt_text.clone();
+            self.fallback_title(&sid, out);
+            self.generate_title(&sid, text, out);
             return true;
         }
-        self.set_collaboration(&sid, DEFAULT_COLLABORATION, out);
-        out.push(update(
-            &sid,
-            json!({"sessionUpdate": "config_option_update", "configOptions": self.config_options(&sid)}),
-        ));
-        let params = json!({"threadId": sid, "input": [{"type": "text", "text": IMPLEMENT_PLAN, "text_elements": []}]});
-        let t = self.threads.get_mut(&sid).expect("found above");
         t.starting = true;
-        out.push(self.send(Pending::TurnStart { client: prompt, thread: sid }, "turn/start", params));
+        self.set_collaboration(&sid, DEFAULT_COLLABORATION, prompt, CollabThen::Implement, out);
         true
     }
 
@@ -722,7 +887,7 @@ impl State {
                     && let Some(t) = p.pointer("/item/text").and_then(Value::as_str)
                 {
                     text.push_str(t);
-                    text.push('\n');
+                    text.push_str("\n\u{1e}");
                 }
             }
             "turn/completed" => {
@@ -733,14 +898,16 @@ impl State {
                         && let Some(t) = item.get("text").and_then(Value::as_str)
                     {
                         text.push_str(t);
-                        text.push('\n');
+                        text.push_str("\n\u{1e}");
                     }
                 }
-                let title = text.lines().find_map(|l| {
+                let parse = |l: &str| {
                     let v: Value = serde_json::from_str(l.trim()).ok()?;
                     let t = v.get("title")?.as_str()?.trim().to_owned();
                     (!t.is_empty()).then_some(t)
-                });
+                };
+                // Each agent message as a whole, as the adapter parses it.
+                let title = text.split("\n\u{1e}").find_map(parse);
                 let explicit = self.threads.get(&main).is_none_or(|t| t.title == TitleSource::Explicit);
                 if let (Some(title), false) = (title, explicit) {
                     out.push(self.send(Pending::Ignore, "thread/name/set", json!({"threadId": main, "name": title})));

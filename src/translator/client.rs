@@ -151,16 +151,22 @@ impl State {
                     Some(Value::Bool(b)) => b.to_string(),
                     _ => return out.push(Out::Client(err(&id, INVALID_PARAMS, "value must be a string"))),
                 };
-                let result = if config_id == commands::COLLABORATION {
-                    if value != commands::PLAN && value != commands::DEFAULT_COLLABORATION {
+                if config_id == commands::COLLABORATION {
+                    let result = if value != commands::PLAN && value != commands::DEFAULT_COLLABORATION {
                         Err(format!("unknown collaboration mode {value:?}"))
                     } else if !self.threads.contains_key(sid) {
                         Err(format!("unknown session {sid}"))
                     } else {
-                        self.set_collaboration(sid, &value, out);
                         Ok(())
+                    };
+                    match result {
+                        // Answered once Codex took it (`collab_done`).
+                        Ok(()) => self.set_collaboration(sid, &value, id, commands::CollabThen::Config, out),
+                        Err(e) => out.push(Out::Client(err(&id, INVALID_PARAMS, e))),
                     }
-                } else if config_id == "mode" {
+                    return;
+                }
+                let result = if config_id == "mode" {
                     self.set_mode(sid, &value)
                 } else {
                     self.set_option(sid, config_id, &value)
@@ -318,7 +324,7 @@ impl State {
             }
             return;
         }
-        if t.turn.is_some() || t.starting || t.plan_review.is_some() {
+        if t.turn.is_some() || t.starting || t.plan_review.is_some() || t.goal_prompt.is_some() {
             return out.push(Out::Client(err(&id, INTERNAL, "a turn is already running in this session")));
         }
         if let Some((name, rest)) = commands::parse(&blocks)
@@ -364,6 +370,7 @@ impl State {
 
     /// Interrupts the session's turn and its subagents' turns.
     pub(super) fn cancel(&mut self, sid: &str, out: &mut Vec<Out>) {
+        self.end_command_prompts(sid, "cancelled", out);
         // A plan review still open: withdraw it, and the prompt ends cancelled.
         if let Some(t) = self.threads.get_mut(sid)
             && let Some((ask, _)) = t.plan_review.take()
