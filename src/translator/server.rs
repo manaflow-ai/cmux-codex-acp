@@ -22,6 +22,13 @@ fn tail(text: &str) -> &str {
     &text[at..]
 }
 
+/// Records that `item` streamed, allocating its id only the first time.
+fn mark_streamed(streamed: &mut HashSet<String>, item: &str) {
+    if !streamed.contains(item) {
+        streamed.insert(item.to_owned());
+    }
+}
+
 fn usage_delta(start: Option<&Value>, now: Option<&Value>) -> Option<Value> {
     let now = now?.get("total")?;
     let n = |v: Option<&Value>, k: &str| v.and_then(|v| v.get(k)).and_then(Value::as_u64).unwrap_or(0);
@@ -43,10 +50,7 @@ impl State {
                 let (method, id) = (method.to_owned(), id.clone());
                 self.server_request(&method, id, msg.get("params").unwrap_or(&Value::Null), out)
             }
-            (Some(method), None) => {
-                let method = method.to_owned();
-                self.server_notification(&method, msg.get("params").unwrap_or(&Value::Null), out)
-            }
+            (Some(method), None) => self.server_notification(method, msg.get("params").unwrap_or(&Value::Null), out),
             (None, Some(id)) => {
                 let Some(pending) = self.pending.remove(&key(id)) else { return };
                 match msg.get("error") {
@@ -210,8 +214,9 @@ impl State {
     }
 
     fn server_notification(&mut self, method: &str, p: &Value, out: &mut Vec<Out>) {
-        let thread = s(p, "threadId").map(str::to_owned);
-        let known = thread.as_deref().is_some_and(|t| self.threads.contains_key(t));
+        // Borrowed from the line: no copy per streamed delta.
+        let thread = s(p, "threadId");
+        let known = thread.is_some_and(|t| self.threads.contains_key(t));
         match method {
             "account/rateLimits/updated" => return self.rate_limits(p, out),
             // A subagent thread whose parent this translator presents.
@@ -223,51 +228,51 @@ impl State {
         match method {
             "turn/started" => {
                 if let (Some(t), Some(turn)) =
-                    (self.threads.get_mut(&sid), p.pointer("/turn/id").and_then(Value::as_str))
+                    (self.threads.get_mut(sid), p.pointer("/turn/id").and_then(Value::as_str))
                 {
                     t.turn = Some(turn.to_owned());
                     t.starting = false;
                 }
             }
-            "turn/completed" => self.turn_completed(&sid, p.get("turn").unwrap_or(&Value::Null), out),
+            "turn/completed" => self.turn_completed(sid, p.get("turn").unwrap_or(&Value::Null), out),
             "item/started" => {
                 if let Some(item) = p.get("item") {
-                    self.item(&sid, item, false, out);
+                    self.item(sid, item, false, out);
                 }
             }
             "item/completed" => {
                 if let Some(item) = p.get("item") {
-                    self.item(&sid, item, true, out);
+                    self.item(sid, item, true, out);
                 }
             }
             "item/agentMessage/delta" => {
                 let (Some(item), Some(delta)) = (s(p, "itemId"), s(p, "delta")) else { return };
-                if let Some(t) = self.threads.get_mut(&sid) {
-                    t.streamed.insert(item.to_owned());
+                if let Some(t) = self.threads.get_mut(sid) {
+                    mark_streamed(&mut t.streamed, item);
                 }
-                out.push(update(&sid, json!({"sessionUpdate": "agent_message_chunk", "messageId": item, "content": {"type": "text", "text": delta}})));
+                out.push(update(sid, json!({"sessionUpdate": "agent_message_chunk", "messageId": item, "content": {"type": "text", "text": delta}})));
             }
             "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
                 let (Some(item), Some(delta)) = (s(p, "itemId"), s(p, "delta")) else { return };
-                if let Some(t) = self.threads.get_mut(&sid) {
-                    t.streamed.insert(item.to_owned());
+                if let Some(t) = self.threads.get_mut(sid) {
+                    mark_streamed(&mut t.streamed, item);
                 }
                 out.push(update(
-                    &sid,
+                    sid,
                     json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": delta}}),
                 ));
             }
             "item/reasoning/summaryPartAdded" => {
                 if p.get("summaryIndex").and_then(Value::as_u64).unwrap_or(0) > 0 {
                     out.push(update(
-                        &sid,
+                        sid,
                         json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "\n\n"}}),
                     ));
                 }
             }
             "item/commandExecution/outputDelta" => {
                 let (Some(item), Some(delta)) = (s(p, "itemId"), s(p, "delta")) else { return };
-                let Some(t) = self.threads.get_mut(&sid) else { return };
+                let Some(t) = self.threads.get_mut(sid) else { return };
                 let (buf, unsent) = t.output.entry(item.to_owned()).or_default();
                 buf.push_str(delta);
                 *unsent += delta.len();
@@ -289,7 +294,7 @@ impl State {
                     u["content"] = json!([{"type": "content", "content": {"type": "text", "text": shown}}]);
                     *unsent = 0;
                 }
-                out.push(update(&sid, u));
+                out.push(update(sid, u));
             }
             "item/fileChange/patchUpdated" => {
                 let Some(item) = s(p, "itemId") else { return };
@@ -297,11 +302,11 @@ impl State {
                     json!({"type": "fileChange", "id": item, "changes": p.get("changes"), "status": "inProgress"});
                 let diffs = items::file_diffs(&fake);
                 if let Some(mut fields) = items::tool_fields(&fake, false, Some(&diffs)) {
-                    if let Some(t) = self.threads.get_mut(&sid) {
+                    if let Some(t) = self.threads.get_mut(sid) {
                         t.tools.insert(item.to_owned(), fields.clone());
                     }
                     fields["sessionUpdate"] = json!("tool_call_update");
-                    out.push(update(&sid, fields));
+                    out.push(update(sid, fields));
                 }
             }
             "turn/plan/updated" => {
@@ -323,27 +328,27 @@ impl State {
                 if let Some(e) = p.get("explanation").filter(|e| e.is_string()) {
                     u["_meta"] = json!({"codexAppServer": {"explanation": e}});
                 }
-                out.push(update(&sid, u));
+                out.push(update(sid, u));
             }
             "thread/tokenUsage/updated" => {
                 let usage = p.get("tokenUsage").cloned().unwrap_or(Value::Null);
                 let used = usage.pointer("/last/totalTokens").and_then(Value::as_u64).unwrap_or(0);
                 let size = usage.get("modelContextWindow").and_then(Value::as_u64).unwrap_or(0);
-                if let Some(t) = self.threads.get_mut(&sid) {
+                if let Some(t) = self.threads.get_mut(sid) {
                     t.usage = Some(usage.clone());
                 }
-                out.push(update(&sid, json!({"sessionUpdate": "usage_update", "used": used, "size": size, "_meta": {"codexAppServer": {"tokenUsage": usage}}})));
+                out.push(update(sid, json!({"sessionUpdate": "usage_update", "used": used, "size": size, "_meta": {"codexAppServer": {"tokenUsage": usage}}})));
             }
             "thread/name/updated" => {
-                out.push(update(&sid, json!({"sessionUpdate": "session_info_update", "title": p.get("threadName").cloned().unwrap_or(Value::Null)})));
+                out.push(update(sid, json!({"sessionUpdate": "session_info_update", "title": p.get("threadName").cloned().unwrap_or(Value::Null)})));
             }
             "model/rerouted" => {
-                if let (Some(t), Some(to)) = (self.threads.get_mut(&sid), s(p, "toModel")) {
+                if let (Some(t), Some(to)) = (self.threads.get_mut(sid), s(p, "toModel")) {
                     t.model = to.to_owned();
                 }
                 out.push(update(
-                    &sid,
-                    json!({"sessionUpdate": "config_option_update", "configOptions": self.config_options(&sid)}),
+                    sid,
+                    json!({"sessionUpdate": "config_option_update", "configOptions": self.config_options(sid)}),
                 ));
             }
             "serverRequest/resolved" => {
