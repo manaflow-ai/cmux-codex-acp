@@ -60,28 +60,30 @@ fn line(v: &Value) -> Vec<u8> {
 }
 
 /// A writer task: lines from `rx` to `w`, flushed when the queue drains, so
-/// neither side's back-pressure stalls the read loop.
+/// neither side's back-pressure stalls the read loop. The lines queued at
+/// that moment go out in one write: tokio's stdout runs each write on its
+/// blocking pool, so a write per streamed delta cost most of the binary's CPU.
 fn writer<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
     mut w: W,
 ) -> (tokio::sync::mpsc::UnboundedSender<Vec<u8>>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let task = tokio::spawn(async move {
-        while let Some(bytes) = rx.recv().await {
-            if w.write_all(&bytes).await.is_err() {
-                return;
+        while let Some(mut batch) = rx.recv().await {
+            while batch.len() < MAX_BATCH
+                && let Ok(more) = rx.try_recv()
+            {
+                batch.extend_from_slice(&more);
             }
-            while let Ok(more) = rx.try_recv() {
-                if w.write_all(&more).await.is_err() {
-                    return;
-                }
-            }
-            if w.flush().await.is_err() {
+            if w.write_all(&batch).await.is_err() || w.flush().await.is_err() {
                 return;
             }
         }
     });
     (tx, task)
 }
+
+/// The most bytes one coalesced write carries before it goes out.
+const MAX_BATCH: usize = 1 << 20;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
