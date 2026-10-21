@@ -157,6 +157,31 @@ if "--robustness" in opts:
     st = step(w, ws, "hello after")
     rob["rejected plan mode: turn runs in"] = [c.split(" ")[1] for c in st["calls"] if c.startswith("turn/start ")]
     w.close()
+    env.pop("FIX_REJECT_SETTINGS", None)
+    v = Agent()
+    v.wait(v.req("initialize", {"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "oracle", "version": "1"}}))
+    vs = v.wait(v.req("session/new", {"cwd": os.getcwd(), "mcpServers": []}))["result"]["sessionId"]
+    rob["goal already complete"] = step(v, vs, "/goal already-done task")["stop"]
+    v.close()
+    env["FIX_HOLD_SETTINGS"] = "1"
+    u = Agent()
+    u.wait(u.req("initialize", {"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "oracle", "version": "1"}}))
+    us = u.wait(u.req("session/new", {"cwd": os.getcwd(), "mcpServers": []}))["result"]["sessionId"]
+    step(u, us, "/plan")
+    i = u.req("session/prompt", {"sessionId": us, "prompt": [{"type": "text", "text": "plan-turn: approve then close"}]})
+    u.until(lambda m: m.get("method") == "session/request_permission")
+    c = u.req("session/close", {"sessionId": us})
+    answers = []
+    while True:
+        m = u.recv()
+        if m.get("id") == i and "method" not in m: answers.append((m.get("result") or {}).get("stopReason") or "error")
+        if m.get("id") == c and "method" not in m: break
+    # A late duplicate would arrive with the next message: ask for one more round trip.
+    u.wait(u.req("session/list", {}))
+    answers += [(m.get("result") or {}).get("stopReason") or "error" for m in u.log if m.get("id") == i and "method" not in m][len(answers):]
+    rob["close while an approved plan waits: answers"] = answers
+    u.close()
+    env.pop("FIX_HOLD_SETTINGS", None)
     res["robust"] = rob
 # The project folder differs per run: write it as <cwd>.
 text = json.dumps(res, indent=1).replace(json.dumps(os.getcwd())[1:-1], "<cwd>")

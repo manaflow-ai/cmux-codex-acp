@@ -257,6 +257,21 @@ impl State {
         let sid = thread.expect("known thread");
         match method {
             "turn/started" => {
+                // The cancelled command turn, started after all: stop it, and keep
+                // it apart from a later prompt's turn.
+                if let (Some(t), Some(turn)) =
+                    (self.threads.get_mut(sid), p.pointer("/turn/id").and_then(Value::as_str))
+                    && t.stale_command_turn
+                    && t.turn.is_none()
+                    && !t.command_turn
+                    && !t.starting
+                {
+                    t.stale_command_turn = false;
+                    t.ignore_turn = Some(turn.to_owned());
+                    let params = json!({"threadId": sid, "turnId": turn});
+                    out.push(self.send(Pending::Ignore, "turn/interrupt", params));
+                    return;
+                }
                 if let (Some(t), Some(turn)) =
                     (self.threads.get_mut(sid), p.pointer("/turn/id").and_then(Value::as_str))
                 {
@@ -457,6 +472,10 @@ impl State {
     fn turn_completed(&mut self, sid: &str, turn: &Value, out: &mut Vec<Out>) {
         let Some(t) = self.threads.get_mut(sid) else { return };
         let turn_id = s(turn, "id");
+        if turn_id.is_some() && t.ignore_turn.as_deref() == turn_id {
+            t.ignore_turn = None;
+            return;
+        }
         if t.turn.as_deref().is_some_and(|cur| Some(cur) != turn_id) {
             return;
         }

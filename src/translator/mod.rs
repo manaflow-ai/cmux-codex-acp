@@ -187,6 +187,11 @@ struct Thread {
     goal_prompt: Option<Value>,
     /// A collaboration mode change waits for Codex.
     collab_pending: bool,
+    /// A command turn was cancelled before it started: the next `turn/started`
+    /// that no prompt asked for is it, and is interrupted.
+    stale_command_turn: bool,
+    /// That turn, once started: its `turn/completed` ends no prompt.
+    ignore_turn: Option<String>,
     /// The title was generated (or asked for) once.
     title_generated: bool,
     /// The running prompt's text, for the title thread.

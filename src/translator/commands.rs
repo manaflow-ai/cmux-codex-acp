@@ -312,7 +312,9 @@ impl State {
         out: &mut Vec<Out>,
     ) {
         let Some(t) = self.threads.get_mut(sid) else {
-            if !client.is_null() {
+            // The session closed while Codex changed the mode: close answered an
+            // approved plan's prompt; a /plan or set_config_option is answered here.
+            if !client.is_null() && !matches!(then, CollabThen::Implement) {
                 out.push(Out::Client(err(&client, INVALID_PARAMS, format!("unknown session {sid}"))));
             }
             return;
@@ -344,7 +346,11 @@ impl State {
             }
             CollabThen::Implement => {
                 out.push(update(sid, json!({"sessionUpdate": "config_option_update", "configOptions": options})));
-                if client.is_null() {
+                // Cancelled while Codex changed the mode: the prompt was answered then.
+                if client.is_null() || self.threads.get(sid).is_none_or(|t| t.prompt.as_ref() != Some(&client)) {
+                    if let Some(t) = self.threads.get_mut(sid) {
+                        t.starting = t.turn.is_none() && t.prompt.is_some() && t.starting;
+                    }
                     return;
                 }
                 let params =
@@ -560,6 +566,9 @@ impl State {
             CommandWait::Compact => {
                 // The compaction turn answers the prompt.
             }
+            CommandWait::GoalActive if client.is_null() => {
+                // Cancelled before its turn: the prompt was answered then.
+            }
             CommandWait::GoalActive => {
                 // An active goal starts a turn, which answers the prompt; a goal
                 // that did not become active (complete, budget limited) starts none.
@@ -621,18 +630,39 @@ impl State {
         if let Some(id) = t.goal_prompt.take() {
             answer(&id, out);
         }
+        let implementing = self.pending.values().any(|p| {
+            matches!(p, Pending::Command { thread, wait: CommandWait::Collab { then: CollabThen::Implement, .. }, .. } if thread == sid)
+        });
+        let Some(t) = self.threads.get_mut(sid) else { return };
+        if implementing && t.turn.is_none() {
+            t.starting = false;
+            if let Some(id) = t.prompt.take() {
+                answer(&id, out);
+            }
+        }
         if t.command_turn && t.turn.is_none() {
-            t.cancel_pending = true;
+            // The turn may still start: it is interrupted then, and never taken
+            // for a later prompt's turn (`stale_command_turn`).
+            t.stale_command_turn = true;
+            t.command_turn = false;
+            t.cancel_pending = false;
             t.starting = false;
             t.compacting = false;
             if let Some(id) = t.prompt.take() {
                 answer(&id, out);
             }
         }
-        // The prompt's Command request (compact, goal) is answered: its reply finds no client.
+        // The prompt's Command request (compact, goal, an approved plan's mode change)
+        // is answered: its reply finds no client.
         for p in self.pending.values_mut() {
-            if let Pending::Command { client, thread, wait: CommandWait::Compact | CommandWait::GoalActive } = p
+            if let Pending::Command { client, thread, wait } = p
                 && thread == sid
+                && matches!(
+                    wait,
+                    CommandWait::Compact
+                        | CommandWait::GoalActive
+                        | CommandWait::Collab { then: CollabThen::Implement, .. }
+                )
             {
                 *client = Value::Null;
             }
@@ -675,6 +705,8 @@ impl State {
                 out.push(say(&sid, &text));
                 out.push(Out::Client(ok(&client, json!({"stopReason": "end_turn"}))));
             }
+            // Cancelled before its turn: the prompt was answered then; a newer prompt is not this one's.
+            CommandWait::Compact | CommandWait::GoalActive if client.is_null() => {}
             CommandWait::Compact | CommandWait::GoalActive => {
                 if let Some(t) = self.threads.get_mut(&sid) {
                     t.prompt = None;
