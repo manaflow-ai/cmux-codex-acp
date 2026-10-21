@@ -195,6 +195,8 @@ if "--robustness" in opts:
     title_inputs = [l for l in fixture_lines()[f0:] if "generate a very short title" in l]
     rob["hidden context: titles"] = titles
     rob["hidden context: reaches the title model"] = any("secret pane list" in l for l in title_inputs)
+    rob["hidden context: the title model gets the words"] = any("hello  titled" in l for l in title_inputs)
+    rob["hidden context: the turn gets it"] = any("secret pane list" in l for l in fixture_lines()[f0:] if l.startswith("turn/start ") and "generate a very short title" not in l)
     q.close()
     res["robust"] = rob
 # The project folder differs per run: write it as <cwd>.

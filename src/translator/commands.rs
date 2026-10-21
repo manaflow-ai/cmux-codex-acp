@@ -115,15 +115,16 @@ pub(super) fn parse(blocks: &[Value]) -> Option<(String, String)> {
 }
 
 /// Whether a block is a client's hidden context, not the person's words: a
-/// block marked `_meta.acpmux.context` (acpmux), or text that is one
-/// `<…-context>` element (the app's `<cmux-workspace-context>`, also as Codex
-/// stores it). A title never comes from it.
+/// block marked `_meta.acpmux.context` (acpmux), or text that starts with a
+/// `<cmux-…-context>` tag (the app's `<cmux-workspace-context>`, also as
+/// Codex stores it). The same rule as acpmux's `prompt_context::is_context_text`.
+/// A title never comes from it.
 fn is_client_context(block: &Value) -> bool {
     if block.pointer("/_meta/acpmux/context").and_then(Value::as_bool) == Some(true) {
         return true;
     }
     let text = block.get("text").and_then(Value::as_str).unwrap_or("").trim_start();
-    text.strip_prefix('<')
+    text.strip_prefix("<cmux-")
         .and_then(|rest| rest.split_once('>'))
         .is_some_and(|(name, _)| name.ends_with("-context") && !name.contains(char::is_whitespace))
 }
@@ -912,8 +913,9 @@ impl State {
         if t.title_generated || matches!(t.title, TitleSource::Explicit | TitleSource::Unknown) {
             return;
         }
-        t.title_generated = true;
+        // A prompt with no words of the person's (only context) keeps the one try.
         let Some(text) = text.filter(|t| !t.trim().is_empty()) else { return };
+        t.title_generated = true;
         let cwd = t.cwd.clone();
         let mut params = json!({"ephemeral": true});
         if !cwd.is_empty() {
