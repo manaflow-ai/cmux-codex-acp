@@ -1,5 +1,6 @@
 //! ACP client -> app-server.
 
+use super::commands;
 use super::*;
 use crate::content;
 
@@ -150,6 +151,21 @@ impl State {
                     Some(Value::Bool(b)) => b.to_string(),
                     _ => return out.push(Out::Client(err(&id, INVALID_PARAMS, "value must be a string"))),
                 };
+                if config_id == commands::COLLABORATION {
+                    let result = if value != commands::PLAN && value != commands::DEFAULT_COLLABORATION {
+                        Err(format!("unknown collaboration mode {value:?}"))
+                    } else if !self.threads.contains_key(sid) {
+                        Err(format!("unknown session {sid}"))
+                    } else {
+                        Ok(())
+                    };
+                    match result {
+                        // Answered once Codex took it (`collab_done`).
+                        Ok(()) => self.set_collaboration(sid, &value, id, commands::CollabThen::Config, out),
+                        Err(e) => out.push(Out::Client(err(&id, INVALID_PARAMS, e))),
+                    }
+                    return;
+                }
                 let result = if config_id == "mode" {
                     self.set_mode(sid, &value)
                 } else {
@@ -308,9 +324,15 @@ impl State {
             }
             return;
         }
-        if t.turn.is_some() || t.starting {
+        if t.turn.is_some() || t.starting || t.plan_review.is_some() || t.goal_prompt.is_some() {
             return out.push(Out::Client(err(&id, INTERNAL, "a turn is already running in this session")));
         }
+        if let Some((name, rest)) = commands::parse(&blocks)
+            && self.command(&id, &sid, &name, &rest, out)
+        {
+            return;
+        }
+        let t = self.threads.get(&sid).expect("checked above");
         out.extend(notice);
         let mut params = json!({"threadId": sid, "input": input});
         // Approval and sandbox only when the mode changed: the app-server
@@ -328,7 +350,14 @@ impl State {
             params["effort"] = json!(t.effort);
         }
         let usage = t.usage.clone();
+        let first_title = commands::title_of(&blocks);
         let t = self.threads.get_mut(&sid).expect("checked above");
+        if t.title == commands::TitleSource::Unset && t.prompt_title.is_none() {
+            t.prompt_title = first_title;
+        }
+        t.prompt_text = commands::raw_text(&blocks);
+        t.command_turn = false;
+        t.plan = None;
         if mode_changed {
             t.applied_mode = t.mode.clone();
         }
@@ -341,6 +370,16 @@ impl State {
 
     /// Interrupts the session's turn and its subagents' turns.
     pub(super) fn cancel(&mut self, sid: &str, out: &mut Vec<Out>) {
+        self.end_command_prompts(sid, "cancelled", out);
+        // A plan review still open: withdraw it, and the prompt ends cancelled.
+        if let Some(t) = self.threads.get_mut(sid)
+            && let Some((ask, _)) = t.plan_review.take()
+        {
+            out.push(Out::Client(notification("$/cancel_request", json!({"requestId": ask}))));
+            if let Some(prompt) = t.prompt.take() {
+                out.push(Out::Client(ok(&prompt, json!({"stopReason": "cancelled"}))));
+            }
+        }
         for tid in self.family(sid) {
             let Some(t) = self.threads.get_mut(&tid) else { continue };
             for (steer, _) in t.queued_steers.drain(..) {
@@ -359,6 +398,9 @@ impl State {
 
     /// The client answered a permission request.
     fn client_answer(&mut self, id: &Value, msg: &Value, out: &mut Vec<Out>) {
+        if self.plan_answer(id, msg, out) {
+            return;
+        }
         let Some(asked) = self.asked.remove(&key(id)) else { return };
         let outcome = msg.pointer("/result/outcome");
         let chosen = match outcome.and_then(|o| s(o, "outcome")) {

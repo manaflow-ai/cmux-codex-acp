@@ -2,6 +2,7 @@
 //! it.
 
 mod client;
+mod commands;
 mod history;
 mod requests;
 mod server;
@@ -89,6 +90,12 @@ enum Pending {
     Ack {
         client: Value,
     },
+    /// A slash command's request (`commands.rs`).
+    Command {
+        client: Value,
+        thread: String,
+        wait: commands::CommandWait,
+    },
     /// Fire and forget (`turn/interrupt`, `thread/unsubscribe` on close).
     Ignore,
 }
@@ -160,6 +167,35 @@ struct Thread {
     usage: Option<Value>,
     /// A subagent's last reported state.
     sub_state: Option<&'static str>,
+    /// The thread's working directory.
+    cwd: String,
+    /// The collaboration mode the session picked (`default` or `plan`); None
+    /// until it picks one, so turns leave Codex's own setting alone.
+    collab: Option<String>,
+    /// Where the session title came from, and the first prompt's text for it.
+    title: commands::TitleSource,
+    prompt_title: Option<String>,
+    /// The running prompt is a `/compact`: it ends when the compaction does.
+    compacting: bool,
+    /// The running turn came from a command (no fallback title).
+    command_turn: bool,
+    /// The plan the running plan-mode turn completed: (item id, text).
+    plan: Option<(String, String)>,
+    /// A plan review asked of the client: (request id, tool call id).
+    plan_review: Option<(Value, String)>,
+    /// A `/goal pause` or `/goal clear` prompt, answered with the goal's update.
+    goal_prompt: Option<Value>,
+    /// A collaboration mode change waits for Codex.
+    collab_pending: bool,
+    /// A command turn was cancelled before it started: the next `turn/started`
+    /// that no prompt asked for is it, and is interrupted.
+    stale_command_turn: bool,
+    /// That turn, once started: its `turn/completed` ends no prompt.
+    ignore_turn: Option<String>,
+    /// The title was generated (or asked for) once.
+    title_generated: bool,
+    /// The running prompt's text, for the title thread.
+    prompt_text: Option<String>,
 }
 
 struct State {
@@ -178,6 +214,10 @@ struct State {
     threads: HashMap<String, Thread>,
     rate_limits: Option<Value>,
     user_agent: Option<String>,
+    /// The account `/status` read last.
+    account: Option<Value>,
+    /// Ephemeral title threads: thread id -> (session, agent text so far).
+    title_threads: HashMap<String, (String, String)>,
 }
 
 /// The first Codex app-server whose `turn/start` takes `{"type": "audio"}` input.
@@ -253,6 +293,8 @@ impl Translator {
                 threads: HashMap::new(),
                 rate_limits: None,
                 user_agent: None,
+                account: None,
+                title_threads: HashMap::new(),
             }),
         }
     }
@@ -295,6 +337,14 @@ impl Translator {
         for id in st.waiting_init.drain(..) {
             out.push(Out::Client(err(&id, INTERNAL, &message)));
         }
+        // Each waiting client request is answered once, even when two records
+        // hold it (a turn's `TurnStart` and its thread's prompt).
+        let mut answered = HashSet::new();
+        let mut fail = |id: &Value, out: &mut Vec<Out>| {
+            if !id.is_null() && answered.insert(key(id)) {
+                out.push(Out::Client(err(id, INTERNAL, &message)));
+            }
+        };
         let pending: Vec<Pending> = st.pending.drain().map(|(_, p)| p).collect();
         for p in pending {
             match p {
@@ -304,20 +354,27 @@ impl Translator {
                 | Pending::ThreadList { client }
                 | Pending::TurnSteer { client }
                 | Pending::Ack { client }
-                | Pending::TurnStart { client, .. } => out.push(Out::Client(err(&client, INTERNAL, &message))),
+                | Pending::Command { client, .. }
+                | Pending::TurnStart { client, .. } => fail(&client, &mut out),
                 _ => {}
             }
         }
         for t in st.threads.values_mut() {
-            if let Some(id) = t.prompt.take() {
-                out.push(Out::Client(err(&id, INTERNAL, &message)));
+            if let Some((ask, _)) = t.plan_review.take() {
+                out.push(Out::Client(notification("$/cancel_request", json!({"requestId": ask}))));
+            }
+            for id in t.prompt.take().into_iter().chain(t.goal_prompt.take()) {
+                fail(&id, &mut out);
             }
             for (id, _) in t.queued_steers.drain(..) {
-                out.push(Out::Client(err(&id, INTERNAL, &message)));
+                fail(&id, &mut out);
             }
             t.turn = None;
             t.starting = false;
+            t.compacting = false;
+            t.command_turn = false;
         }
+        st.title_threads.clear();
         let queued: Vec<Value> = std::mem::take(&mut st.queued);
         for m in queued {
             if let Some(id) = m.get("id").filter(|_| m.get("method").is_some()) {
@@ -381,12 +438,16 @@ impl State {
 
     fn config_options(&self, thread: &str) -> Value {
         let t = self.threads.get(thread);
-        config::config_options(
+        let mut options = config::config_options(
             &self.models,
             t.map(|t| t.model.as_str()).unwrap_or(""),
             t.map(|t| t.effort.as_str()).unwrap_or(config::DEFAULT_EFFORT),
             t.map(|t| t.mode.as_str()).unwrap_or(config::DEFAULT_MODE),
-        )
+        );
+        if let Some(list) = options.as_array_mut() {
+            list.push(self.collaboration_option(thread));
+        }
+        options
     }
 
     /// The `session/new`/`load`/`fork` result for a thread.
@@ -439,8 +500,17 @@ impl State {
         let effort = effort
             .or_else(|| result.get("reasoningEffort").and_then(Value::as_str).map(str::to_owned))
             .unwrap_or_else(|| config::DEFAULT_EFFORT.into());
+        let cwd = result
+            .pointer("/thread/cwd")
+            .or_else(|| result.get("cwd"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
         let t = self.threads.entry(id.clone()).or_default();
         t.parent = None;
+        if !cwd.is_empty() {
+            t.cwd = cwd;
+        }
         t.applied_mode = mode.clone();
         t.mode = mode;
         t.model = model;

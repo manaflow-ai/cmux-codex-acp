@@ -83,6 +83,8 @@ pub struct ModelInfo {
     pub description: String,
     pub efforts: Vec<(String, String)>,
     pub is_default: bool,
+    /// The effort the model runs at when none is picked (`defaultReasoningEffort`).
+    pub default_effort: Option<String>,
     /// What the model takes as input (`inputModalities`: `text`, `image`,
     /// `audio`); empty when the app-server does not say.
     pub input_modalities: Vec<String>,
@@ -116,6 +118,7 @@ pub fn parse_models(result: &Value) -> Vec<ModelInfo> {
                 .filter_map(|e| Some((e.get("reasoningEffort")?.as_str()?.to_owned(), s(e, "description"))))
                 .collect(),
             is_default: m.get("isDefault").and_then(Value::as_bool).unwrap_or(false),
+            default_effort: m.get("defaultReasoningEffort").and_then(Value::as_str).map(str::to_owned),
             input_modalities: m
                 .get("inputModalities")
                 .and_then(Value::as_array)

@@ -1,5 +1,6 @@
 //! app-server -> ACP client: responses and notifications.
 
+use super::commands;
 use super::*;
 use crate::items;
 
@@ -77,6 +78,7 @@ impl State {
                 if let Some(t) = self.threads.get_mut(&thread) {
                     t.prompt = None;
                     t.starting = false;
+                    t.command_turn = false;
                     // The overrides may not have reached Codex: send them again.
                     t.applied_mode.clear();
                     for (steer, _) in t.queued_steers.drain(..) {
@@ -101,6 +103,7 @@ impl State {
             | Pending::ThreadFork { client, .. }
             | Pending::ThreadList { client }
             | Pending::Ack { client } => out.push(Out::Client(err(&client, code, message))),
+            Pending::Command { client, thread, wait } => self.command_error(client, thread, wait, code, message, out),
         }
     }
 
@@ -134,6 +137,7 @@ impl State {
                 Some(sid) => {
                     let extra = json!({"_meta": {"codexAppServer": {"threadPath": r.pointer("/thread/path"), "cliVersion": r.pointer("/thread/cliVersion"), "model": r.get("model")}}});
                     out.push(Out::Client(ok(&client, self.session_result(&sid, extra))));
+                    self.publish_commands(&sid, out);
                 }
                 None => out.push(Out::Client(err(&client, INTERNAL, "thread/start returned no thread"))),
             },
@@ -144,6 +148,19 @@ impl State {
                 };
                 if replay {
                     self.replay(&sid, r.pointer("/thread/turns"), out);
+                    self.history_title(&sid, r.get("thread").unwrap_or(&Value::Null), out);
+                } else if let Some(t) = self.threads.get_mut(&sid) {
+                    // Resumed without its history: its title stays the client's,
+                    // unless the thread has a name of its own.
+                    if t.title == commands::TitleSource::Unset {
+                        t.title = commands::TitleSource::Unknown;
+                    }
+                    if let Some(name) =
+                        r.pointer("/thread/name").and_then(Value::as_str).filter(|n| !n.trim().is_empty())
+                    {
+                        t.title = commands::TitleSource::Explicit;
+                        out.push(update(&sid, json!({"sessionUpdate": "session_info_update", "title": name.split_whitespace().collect::<Vec<_>>().join(" ")})));
+                    }
                 }
                 // A thread resumed mid-turn (still live in this app-server).
                 if let Some(turn) = r
@@ -157,9 +174,13 @@ impl State {
                     t.turn = Some(turn.to_owned());
                 }
                 out.push(Out::Client(ok(&client, self.session_result(&sid, json!({})))));
+                self.publish_commands(&sid, out);
             }
             Pending::ThreadFork { client, mode } => match self.adopt_thread(r, mode, None) {
-                Some(sid) => out.push(Out::Client(ok(&client, self.session_result(&sid, json!({}))))),
+                Some(sid) => {
+                    out.push(Out::Client(ok(&client, self.session_result(&sid, json!({})))));
+                    self.publish_commands(&sid, out);
+                }
                 None => out.push(Out::Client(err(&client, INTERNAL, "thread/fork returned no thread"))),
             },
             Pending::ThreadList { client } => {
@@ -209,6 +230,7 @@ impl State {
             }
             Pending::TurnSteer { client } => out.push(Out::Client(ok(&client, json!({"stopReason": "steered"})))),
             Pending::Ack { client } => out.push(Out::Client(ok(&client, json!({})))),
+            Pending::Command { client, thread, wait } => self.command_result(client, thread, wait, r, out),
             Pending::Ignore => {}
         }
     }
@@ -221,18 +243,87 @@ impl State {
             "account/rateLimits/updated" => return self.rate_limits(p, out),
             // A subagent thread whose parent this translator presents.
             "thread/started" => return self.thread_started(p.get("thread").unwrap_or(&Value::Null), out),
+            _ if !known && self.title_line(method, p, out) => return,
+            // Skills changed on disk (no thread): every session's `$skill` list again.
+            "skills/changed" => {
+                for sid in self.roots() {
+                    self.publish_commands(&sid, out);
+                }
+                return;
+            }
             _ if !known => return,
             _ => {}
         }
         let sid = thread.expect("known thread");
         match method {
             "turn/started" => {
+                // The cancelled command turn, started after all: stop it, and keep
+                // it apart from a later prompt's turn.
+                if let (Some(t), Some(turn)) =
+                    (self.threads.get_mut(sid), p.pointer("/turn/id").and_then(Value::as_str))
+                    && t.stale_command_turn
+                    && t.turn.is_none()
+                    && !t.command_turn
+                    && !t.starting
+                {
+                    t.stale_command_turn = false;
+                    t.ignore_turn = Some(turn.to_owned());
+                    let params = json!({"threadId": sid, "turnId": turn});
+                    out.push(self.send(Pending::Ignore, "turn/interrupt", params));
+                    return;
+                }
                 if let (Some(t), Some(turn)) =
                     (self.threads.get_mut(sid), p.pointer("/turn/id").and_then(Value::as_str))
                 {
                     t.turn = Some(turn.to_owned());
                     t.starting = false;
+                    // A command's turn (`/compact`, `/goal`) gets its id only
+                    // here: a cancel that came before it stops it now, and steers
+                    // that came before it reach it now.
+                    if t.command_turn {
+                        let steers = std::mem::take(&mut t.queued_steers);
+                        if std::mem::take(&mut t.cancel_pending) {
+                            for (steer, _) in steers {
+                                out.push(Out::Client(err(&steer, INTERNAL, crate::STEER_NO_TURN)));
+                            }
+                            let params = json!({"threadId": sid, "turnId": turn});
+                            out.push(self.send(Pending::Ignore, "turn/interrupt", params));
+                        } else {
+                            for (steer, input) in steers {
+                                let params = json!({"threadId": sid, "expectedTurnId": turn, "input": input});
+                                out.push(self.send(Pending::TurnSteer { client: steer }, "turn/steer", params));
+                            }
+                        }
+                    }
                 }
+            }
+            "thread/compacted" => {
+                out.push(update(sid, json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "*Context compacted to fit the model's context window.*\n\n"}})));
+                self.compacted(sid, out);
+            }
+            "thread/settings/updated" => {
+                let mode = p.pointer("/threadSettings/collaborationMode/mode").and_then(Value::as_str);
+                if let (Some(t), Some(mode)) = (self.threads.get_mut(sid), mode)
+                    && !t.collab_pending
+                    && t.collab.as_deref() != Some(mode)
+                {
+                    t.collab = Some(mode.to_owned());
+                    out.push(update(
+                        sid,
+                        json!({"sessionUpdate": "config_option_update", "configOptions": self.config_options(sid)}),
+                    ));
+                }
+            }
+            "thread/goal/updated" => {
+                out.push(update(
+                    sid,
+                    json!({"sessionUpdate": "session_info_update", "_meta": {"goal": p.get("goal")}}),
+                ));
+                self.goal_changed(sid, out);
+            }
+            "thread/goal/cleared" => {
+                out.push(update(sid, json!({"sessionUpdate": "session_info_update", "_meta": {"goal": null}})));
+                self.goal_changed(sid, out);
             }
             "turn/completed" => self.turn_completed(sid, p.get("turn").unwrap_or(&Value::Null), out),
             "item/started" => {
@@ -343,6 +434,13 @@ impl State {
                 out.push(update(sid, json!({"sessionUpdate": "usage_update", "used": used, "size": size, "_meta": {"codexAppServer": {"tokenUsage": usage}}})));
             }
             "thread/name/updated" => {
+                if let Some(t) = self.threads.get_mut(sid) {
+                    t.title = if p.get("threadName").is_some_and(|n| !n.is_null()) {
+                        commands::TitleSource::Explicit
+                    } else {
+                        commands::TitleSource::Unset
+                    };
+                }
                 out.push(update(sid, json!({"sessionUpdate": "session_info_update", "title": p.get("threadName").cloned().unwrap_or(Value::Null)})));
             }
             "model/rerouted" => {
@@ -374,6 +472,10 @@ impl State {
     fn turn_completed(&mut self, sid: &str, turn: &Value, out: &mut Vec<Out>) {
         let Some(t) = self.threads.get_mut(sid) else { return };
         let turn_id = s(turn, "id");
+        if turn_id.is_some() && t.ignore_turn.as_deref() == turn_id {
+            t.ignore_turn = None;
+            return;
+        }
         if t.turn.as_deref().is_some_and(|cur| Some(cur) != turn_id) {
             return;
         }
@@ -383,11 +485,24 @@ impl State {
         t.output.clear();
         t.tools.clear();
         t.streamed.clear();
-        let prompt = t.prompt.take();
+        t.compacting = false;
+        let command_turn = std::mem::take(&mut t.command_turn);
         for (steer, _) in steers {
             out.push(Out::Client(err(&steer, INTERNAL, crate::STEER_NO_TURN)));
         }
-        let Some(prompt) = prompt else { return };
+        // A plan-mode turn that made a plan asks whether to implement it; the
+        // prompt waits for the answer.
+        if s(turn, "status") == Some("completed") && self.ask_plan(sid, out) {
+            return;
+        }
+        let Some(t) = self.threads.get_mut(sid) else { return };
+        t.plan = None;
+        let Some(prompt) = t.prompt.take() else { return };
+        if !command_turn && s(turn, "status") == Some("completed") {
+            let text = self.threads.get(sid).and_then(|t| t.prompt_text.clone());
+            self.fallback_title(sid, out);
+            self.generate_title(sid, text, out);
+        }
         let t = self.threads.get(sid).expect("checked above");
         let usage = usage_delta(t.usage_at_start.as_ref(), t.usage.as_ref());
         match s(turn, "status") {
@@ -412,10 +527,33 @@ impl State {
     pub(super) fn item(&mut self, sid: &str, item: &Value, done: bool, out: &mut Vec<Out>) {
         let Some(id) = s(item, "id").map(str::to_owned) else { return };
         match s(item, "type").unwrap_or("") {
-            "userMessage" | "hookPrompt" | "functionCallOutput" | "enteredReviewMode" | "exitedReviewMode" => {}
+            "userMessage" | "hookPrompt" | "functionCallOutput" | "enteredReviewMode" => {}
+            "contextCompaction" => {
+                let meta = json!({"contextCompaction": {"version": 1}});
+                if done {
+                    out.push(update(sid, json!({"sessionUpdate": "tool_call_update", "toolCallId": id, "title": "Compact conversation", "status": "completed", "_meta": meta})));
+                    self.compacted(sid, out);
+                } else {
+                    out.push(update(sid, json!({"sessionUpdate": "tool_call", "toolCallId": id, "kind": "think", "title": "Compact conversation", "status": "in_progress", "_meta": meta})));
+                }
+            }
+            "exitedReviewMode" => {
+                if let Some(review) = s(item, "review").map(str::trim).filter(|r| !r.is_empty() && done) {
+                    out.push(update(
+                        sid,
+                        json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": review}}),
+                    ));
+                }
+            }
             "agentMessage" | "plan" => {
                 if !done {
                     return;
+                }
+                if s(item, "type") == Some("plan")
+                    && let Some(text) = s(item, "text").filter(|t| !t.is_empty())
+                    && let Some(t) = self.threads.get_mut(sid)
+                {
+                    t.plan = Some((id.clone(), text.to_owned()));
                 }
                 let streamed = self.threads.get_mut(sid).is_some_and(|t| t.streamed.remove(&id));
                 if let Some(text) = s(item, "text").filter(|t| !t.is_empty() && !streamed) {
