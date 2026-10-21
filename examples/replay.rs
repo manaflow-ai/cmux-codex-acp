@@ -58,9 +58,13 @@ fn pump(tr: &Translator, outs: Vec<Out>, client: &mut Vec<Value>) {
                 };
                 let result = match method {
                     "initialize" => json!({"userAgent": "codex_cli_rs/0.162.1 (Linux; x86_64) bench"}),
-                    "model/list" => json!({"data": [{"id": "gpt-6-astra", "model": "gpt-6-astra", "displayName": "gpt-6-astra",
-                        "supportedReasoningEfforts": [{"reasoningEffort": "medium"}], "defaultReasoningEffort": "medium", "isDefault": true}], "nextCursor": null}),
-                    "thread/start" => json!({"thread": {"id": THREAD, "cwd": "/w", "turns": []}, "model": "gpt-6-astra", "reasoningEffort": "medium"}),
+                    "model/list" => {
+                        json!({"data": [{"id": "gpt-6-astra", "model": "gpt-6-astra", "displayName": "gpt-6-astra",
+                        "supportedReasoningEfforts": [{"reasoningEffort": "medium"}], "defaultReasoningEffort": "medium", "isDefault": true}], "nextCursor": null})
+                    }
+                    "thread/start" => {
+                        json!({"thread": {"id": THREAD, "cwd": "/w", "turns": []}, "model": "gpt-6-astra", "reasoningEffort": "medium"})
+                    }
                     "turn/start" => json!({"turn": {"id": "turn-1", "status": "inProgress", "items": []}}),
                     _ => json!({}),
                 };
@@ -120,7 +124,11 @@ fn main() {
     for (name, method, item) in kinds {
         let lines: Vec<String> = (0..deltas)
             .map(|i| {
-                let d = if name == "output" { format!("test case_{i:04} ... ok\n") } else { format!("{} ", words[i % words.len()]) };
+                let d = if name == "output" {
+                    format!("test case_{i:04} ... ok\n")
+                } else {
+                    format!("{} ", words[i % words.len()])
+                };
                 line(method, item, d)
             })
             .collect();
