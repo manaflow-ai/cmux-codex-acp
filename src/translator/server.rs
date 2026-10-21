@@ -273,7 +273,10 @@ impl State {
             "item/commandExecution/outputDelta" => {
                 let (Some(item), Some(delta)) = (s(p, "itemId"), s(p, "delta")) else { return };
                 let Some(t) = self.threads.get_mut(sid) else { return };
-                let (buf, unsent) = t.output.entry(item.to_owned()).or_default();
+                if !t.output.contains_key(item) {
+                    t.output.insert(item.to_owned(), Default::default());
+                }
+                let Some((buf, unsent)) = t.output.get_mut(item) else { return };
                 buf.push_str(delta);
                 *unsent += delta.len();
                 // Keep only the tail a client is shown.
