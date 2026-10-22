@@ -69,12 +69,6 @@ impl State {
     fn client_request(&mut self, method: &str, id: Value, p: Value, out: &mut Vec<Out>) {
         match method {
             "authenticate" => out.push(Out::Client(ok(&id, json!({})))),
-            "session/new" | "session/load" | "session/resume" | "session/fork"
-                if p.pointer("/_meta/generateTitle").and_then(Value::as_bool) == Some(false) =>
-            {
-                self.no_title.insert(key(&id));
-                self.client_request_session(method, id, p, out)
-            }
             "session/new" | "session/load" | "session/resume" | "session/fork" => {
                 self.client_request_session(method, id, p, out)
             }
@@ -251,6 +245,11 @@ impl State {
         params
     }
 
+    /// `_meta.cmux.generateTitle: false` on a session request: no generated title for it.
+    fn wants_titles(&self, p: &Value) -> bool {
+        self.opts.generate_titles && p.pointer("/_meta/cmux/generateTitle").and_then(Value::as_bool) != Some(false)
+    }
+
     fn client_request_session(&mut self, method: &str, id: Value, p: Value, out: &mut Vec<Out>) {
         match method {
             "session/new" => self.session_new(id, &p, out),
@@ -267,7 +266,8 @@ impl State {
             params["model"] = json!(m);
         }
         let effort = self.opts.effort.clone().unwrap_or_else(|| config::DEFAULT_EFFORT.into());
-        out.push(self.send(Pending::ThreadStart { client: id, mode, effort }, "thread/start", params));
+        let titles = self.wants_titles(p);
+        out.push(self.send(Pending::ThreadStart { client: id, mode, effort, titles }, "thread/start", params));
     }
 
     fn session_resume(&mut self, id: Value, p: &Value, replay: bool, out: &mut Vec<Out>) {
@@ -278,7 +278,12 @@ impl State {
         let mut params = self.thread_params(p, &mode);
         params["threadId"] = json!(sid);
         params["excludeTurns"] = json!(!replay);
-        out.push(self.send(Pending::ThreadResume { client: id, session: sid, mode, replay }, "thread/resume", params));
+        let titles = self.wants_titles(p);
+        out.push(self.send(
+            Pending::ThreadResume { client: id, session: sid, mode, replay, titles },
+            "thread/resume",
+            params,
+        ));
     }
 
     fn session_fork(&mut self, id: Value, p: &Value, out: &mut Vec<Out>) {
@@ -292,7 +297,8 @@ impl State {
         if let Some(last) = p.pointer("/_meta/lastTurnId").filter(|v| v.is_string()) {
             params["lastTurnId"] = last.clone();
         }
-        out.push(self.send(Pending::ThreadFork { client: id, mode }, "thread/fork", params));
+        let titles = self.wants_titles(p);
+        out.push(self.send(Pending::ThreadFork { client: id, mode, titles }, "thread/fork", params));
     }
 
     fn prompt(&mut self, id: Value, p: &Value, out: &mut Vec<Out>) {

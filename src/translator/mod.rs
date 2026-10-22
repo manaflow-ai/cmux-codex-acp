@@ -42,8 +42,8 @@ pub struct Options {
     /// ephemeral Codex thread on the title model, then `thread/name/set`), as
     /// the codex-acp adapter does. Off: a session keeps its fallback title
     /// (the first prompt) and its thread name. A session can also turn it off
-    /// for itself with `_meta.generateTitle: false` on `session/new`, `load`,
-    /// `resume` or `fork`.
+    /// for itself with `_meta.cmux.generateTitle: false` on `session/new`,
+    /// `load`, `resume` or `fork`.
     pub generate_titles: bool,
 }
 
@@ -72,6 +72,8 @@ enum Pending {
         client: Value,
         mode: String,
         effort: String,
+        /// False: this session asked for no generated title.
+        titles: bool,
     },
     /// `session/load` (replay) or `session/resume` (no replay).
     ThreadResume {
@@ -79,10 +81,12 @@ enum Pending {
         session: String,
         mode: String,
         replay: bool,
+        titles: bool,
     },
     ThreadFork {
         client: Value,
         mode: String,
+        titles: bool,
     },
     ThreadList {
         client: Value,
@@ -224,8 +228,6 @@ struct State {
     user_agent: Option<String>,
     /// The account `/status` read last.
     account: Option<Value>,
-    /// Session requests that asked for no generated title (`_meta.generateTitle: false`).
-    no_title: HashSet<String>,
     /// Ephemeral title threads: thread id -> (session, agent text so far).
     title_threads: HashMap<String, (String, String)>,
 }
@@ -305,7 +307,6 @@ impl Translator {
                 user_agent: None,
                 account: None,
                 title_threads: HashMap::new(),
-                no_title: HashSet::new(),
             }),
         }
     }

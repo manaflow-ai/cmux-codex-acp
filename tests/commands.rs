@@ -70,6 +70,7 @@ fn slash_commands_match_the_node_adapter() {
         "hidden context: the turn gets it": true,
         "generateTitle false: titles": ["hello without a generated title"],
         "generateTitle false: title model asked": false,
+        "generateTitle on: title thread started": true,
     });
     assert_eq!(robust, &want, "cancel, exit and refusal paths");
     let _ = std::fs::remove_dir_all(&project);

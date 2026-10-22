@@ -200,12 +200,23 @@ if "--robustness" in opts:
     q.close()
     o = Agent()
     o.wait(o.req("initialize", {"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "oracle", "version": "1"}}))
-    os_ = o.wait(o.req("session/new", {"cwd": os.getcwd(), "mcpServers": [], "_meta": {"generateTitle": False}}))["result"]["sessionId"]
+    os_ = o.wait(o.req("session/new", {"cwd": os.getcwd(), "mcpServers": [], "_meta": {"cmux": {"generateTitle": False}}}))["result"]["sessionId"]
     f0 = len(fixture_lines())
     st = step(o, os_, "hello without a generated title")
     o.wait(o.req("session/list", {}))
     rob["generateTitle false: titles"] = st["titles"]
-    rob["generateTitle false: title model asked"] = any("generate a very short title" in l or l.startswith("title-turn") for l in fixture_lines()[f0:])
+    # The title thread's thread/start goes out with the prompt's result, so the
+    # session/list round trip comes after it: any thread/start after f0 is one.
+    rob["generateTitle false: title model asked"] = any(l == "thread/start" or l.startswith("title-turn") for l in fixture_lines()[f0:])
+    # Control: the same flow with titles on starts the title thread.
+    c = Agent()
+    c.wait(c.req("initialize", {"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "oracle", "version": "1"}}))
+    cs = c.wait(c.req("session/new", {"cwd": os.getcwd(), "mcpServers": []}))["result"]["sessionId"]
+    f1 = len(fixture_lines())
+    step(c, cs, "hello with a generated title")
+    c.wait(c.req("session/list", {}))
+    rob["generateTitle on: title thread started"] = "thread/start" in fixture_lines()[f1:]
+    c.close()
     o.close()
     res["robust"] = rob
 # The project folder differs per run: write it as <cwd>.
