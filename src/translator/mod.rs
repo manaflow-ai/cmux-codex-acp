@@ -38,6 +38,13 @@ pub struct Options {
     /// or after [`AUDIO_INPUT_VERSION`]: older ones reject the `audio` input
     /// variant, so an unknown version gets none.
     pub audio_input: bool,
+    /// Generate a short title for a new session after its first turn (an
+    /// ephemeral Codex thread on the title model, then `thread/name/set`), as
+    /// the codex-acp adapter does. Off: a session keeps its fallback title
+    /// (the first prompt) and its thread name. A session can also turn it off
+    /// for itself with `_meta.cmux.generateTitle: false` on `session/new`,
+    /// `load`, `resume` or `fork`.
+    pub generate_titles: bool,
 }
 
 impl Default for Options {
@@ -50,6 +57,7 @@ impl Default for Options {
             model: None,
             effort: None,
             audio_input: false,
+            generate_titles: true,
         }
     }
 }
@@ -64,6 +72,8 @@ enum Pending {
         client: Value,
         mode: String,
         effort: String,
+        /// False: this session asked for no generated title.
+        titles: bool,
     },
     /// `session/load` (replay) or `session/resume` (no replay).
     ThreadResume {
@@ -71,10 +81,12 @@ enum Pending {
         session: String,
         mode: String,
         replay: bool,
+        titles: bool,
     },
     ThreadFork {
         client: Value,
         mode: String,
+        titles: bool,
     },
     ThreadList {
         client: Value,

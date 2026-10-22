@@ -23,7 +23,9 @@ struct Args {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: cmux-codex-acp [--codex PATH] [-c key=value]... [--model MODEL] [--effort EFFORT] [--mode MODE]");
+    eprintln!(
+        "usage: cmux-codex-acp [--codex PATH] [-c key=value]... [--model MODEL] [--effort EFFORT] [--mode MODE] [--no-titles]"
+    );
     std::process::exit(2)
 }
 
@@ -42,6 +44,7 @@ fn parse_args() -> Args {
             "--model" => args.opts.model = Some(value()),
             "--effort" => args.opts.effort = Some(value()),
             "--mode" => args.opts.default_mode = value(),
+            "--no-titles" => args.opts.generate_titles = false,
             "--version" => {
                 println!("cmux-codex-acp {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0)

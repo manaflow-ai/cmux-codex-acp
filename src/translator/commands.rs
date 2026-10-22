@@ -907,6 +907,13 @@ impl State {
         out.push(update(sid, json!({"sessionUpdate": "session_info_update", "title": title})));
     }
 
+    /// The session opened as `sid` asked for no generated title (`titles` false).
+    pub(super) fn title_choice(&mut self, sid: &str, titles: bool) {
+        if !titles && let Some(t) = self.threads.get_mut(sid) {
+            t.title_generated = true;
+        }
+    }
+
     /// After a new session's first completed turn: generate its title (once).
     pub(super) fn generate_title(&mut self, sid: &str, text: Option<String>, out: &mut Vec<Out>) {
         let Some(t) = self.threads.get_mut(sid) else { return };
