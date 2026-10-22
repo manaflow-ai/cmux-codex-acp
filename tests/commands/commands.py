@@ -198,6 +198,15 @@ if "--robustness" in opts:
     rob["hidden context: the title model gets the words"] = any("hello  titled" in l for l in title_inputs)
     rob["hidden context: the turn gets it"] = any("secret pane list" in l for l in fixture_lines()[f0:] if l.startswith("turn/start ") and "generate a very short title" not in l)
     q.close()
+    o = Agent()
+    o.wait(o.req("initialize", {"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "oracle", "version": "1"}}))
+    os_ = o.wait(o.req("session/new", {"cwd": os.getcwd(), "mcpServers": [], "_meta": {"generateTitle": False}}))["result"]["sessionId"]
+    f0 = len(fixture_lines())
+    st = step(o, os_, "hello without a generated title")
+    o.wait(o.req("session/list", {}))
+    rob["generateTitle false: titles"] = st["titles"]
+    rob["generateTitle false: title model asked"] = any("generate a very short title" in l or l.startswith("title-turn") for l in fixture_lines()[f0:])
+    o.close()
     res["robust"] = rob
 # The project folder differs per run: write it as <cwd>.
 text = json.dumps(res, indent=1).replace(json.dumps(os.getcwd())[1:-1], "<cwd>")

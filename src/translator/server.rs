@@ -100,9 +100,13 @@ impl State {
             }
             Pending::ThreadStart { client, .. }
             | Pending::ThreadResume { client, .. }
-            | Pending::ThreadFork { client, .. }
-            | Pending::ThreadList { client }
-            | Pending::Ack { client } => out.push(Out::Client(err(&client, code, message))),
+            | Pending::ThreadFork { client, .. } => {
+                self.no_title.remove(&key(&client));
+                out.push(Out::Client(err(&client, code, message)))
+            }
+            Pending::ThreadList { client } | Pending::Ack { client } => {
+                out.push(Out::Client(err(&client, code, message)))
+            }
             Pending::Command { client, thread, wait } => self.command_error(client, thread, wait, code, message, out),
         }
     }
@@ -135,6 +139,7 @@ impl State {
             }
             Pending::ThreadStart { client, mode, effort } => match self.adopt_thread(r, mode, Some(effort)) {
                 Some(sid) => {
+                    self.title_choice(&client, &sid);
                     let extra = json!({"_meta": {"codexAppServer": {"threadPath": r.pointer("/thread/path"), "cliVersion": r.pointer("/thread/cliVersion"), "model": r.get("model")}}});
                     out.push(Out::Client(ok(&client, self.session_result(&sid, extra))));
                     self.publish_commands(&sid, out);
@@ -146,6 +151,7 @@ impl State {
                 let Some(sid) = self.adopt_thread(r, mode, effort) else {
                     return out.push(Out::Client(err(&client, INTERNAL, "thread/resume returned no thread")));
                 };
+                self.title_choice(&client, &sid);
                 if replay {
                     self.replay(&sid, r.pointer("/thread/turns"), out);
                     self.history_title(&sid, r.get("thread").unwrap_or(&Value::Null), out);
@@ -178,6 +184,7 @@ impl State {
             }
             Pending::ThreadFork { client, mode } => match self.adopt_thread(r, mode, None) {
                 Some(sid) => {
+                    self.title_choice(&client, &sid);
                     out.push(Out::Client(ok(&client, self.session_result(&sid, json!({})))));
                     self.publish_commands(&sid, out);
                 }

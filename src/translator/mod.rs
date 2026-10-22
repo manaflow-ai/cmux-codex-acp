@@ -38,6 +38,13 @@ pub struct Options {
     /// or after [`AUDIO_INPUT_VERSION`]: older ones reject the `audio` input
     /// variant, so an unknown version gets none.
     pub audio_input: bool,
+    /// Generate a short title for a new session after its first turn (an
+    /// ephemeral Codex thread on the title model, then `thread/name/set`), as
+    /// the codex-acp adapter does. Off: a session keeps its fallback title
+    /// (the first prompt) and its thread name. A session can also turn it off
+    /// for itself with `_meta.generateTitle: false` on `session/new`, `load`,
+    /// `resume` or `fork`.
+    pub generate_titles: bool,
 }
 
 impl Default for Options {
@@ -50,6 +57,7 @@ impl Default for Options {
             model: None,
             effort: None,
             audio_input: false,
+            generate_titles: true,
         }
     }
 }
@@ -216,6 +224,8 @@ struct State {
     user_agent: Option<String>,
     /// The account `/status` read last.
     account: Option<Value>,
+    /// Session requests that asked for no generated title (`_meta.generateTitle: false`).
+    no_title: HashSet<String>,
     /// Ephemeral title threads: thread id -> (session, agent text so far).
     title_threads: HashMap<String, (String, String)>,
 }
@@ -295,6 +305,7 @@ impl Translator {
                 user_agent: None,
                 account: None,
                 title_threads: HashMap::new(),
+                no_title: HashSet::new(),
             }),
         }
     }

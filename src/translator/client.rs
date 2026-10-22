@@ -69,10 +69,15 @@ impl State {
     fn client_request(&mut self, method: &str, id: Value, p: Value, out: &mut Vec<Out>) {
         match method {
             "authenticate" => out.push(Out::Client(ok(&id, json!({})))),
-            "session/new" => self.session_new(id, &p, out),
-            "session/load" => self.session_resume(id, &p, true, out),
-            "session/resume" => self.session_resume(id, &p, false, out),
-            "session/fork" => self.session_fork(id, &p, out),
+            "session/new" | "session/load" | "session/resume" | "session/fork"
+                if p.pointer("/_meta/generateTitle").and_then(Value::as_bool) == Some(false) =>
+            {
+                self.no_title.insert(key(&id));
+                self.client_request_session(method, id, p, out)
+            }
+            "session/new" | "session/load" | "session/resume" | "session/fork" => {
+                self.client_request_session(method, id, p, out)
+            }
             "session/list" => {
                 let mut params = json!({"limit": 50});
                 if let Some(cwd) = p.get("cwd").filter(|c| c.is_string()) {
@@ -244,6 +249,15 @@ impl State {
             params["config"] = cfg;
         }
         params
+    }
+
+    fn client_request_session(&mut self, method: &str, id: Value, p: Value, out: &mut Vec<Out>) {
+        match method {
+            "session/new" => self.session_new(id, &p, out),
+            "session/load" => self.session_resume(id, &p, true, out),
+            "session/resume" => self.session_resume(id, &p, false, out),
+            _ => self.session_fork(id, &p, out),
+        }
     }
 
     fn session_new(&mut self, id: Value, p: &Value, out: &mut Vec<Out>) {
