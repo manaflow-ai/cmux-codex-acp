@@ -620,6 +620,11 @@ impl State {
             }
             CommandWait::GoalUpdate => {
                 // The RPC result confirms persistence. The notification may already have arrived.
+                if let Some(goal) = r.get("goal") {
+                    self.goal_update(&sid, Some(goal), false, out);
+                } else if r.get("cleared") == Some(&Value::Bool(true)) {
+                    self.goal_update(&sid, None, false, out);
+                }
                 done(out);
             }
         }

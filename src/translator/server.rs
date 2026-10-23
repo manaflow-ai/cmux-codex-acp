@@ -243,7 +243,11 @@ impl State {
             Pending::TurnSteer { client } => out.push(Out::Client(ok(&client, json!({"stopReason": "steered"})))),
             Pending::Ack { client } => out.push(Out::Client(ok(&client, json!({})))),
             Pending::Command { client, thread, wait } => self.command_result(client, thread, wait, r, out),
-            Pending::GoalRead { thread } => self.goal_update(&thread, r.get("goal"), out),
+            Pending::GoalRead { thread, version } => {
+                if self.threads.get(&thread).is_some_and(|t| t.goal_version == version) {
+                    self.goal_update(&thread, r.get("goal"), true, out);
+                }
+            }
             Pending::GoalSend { client, thread, input } => {
                 self.steer_goal_send(client, &thread, input, &r["thread"], out)
             }
@@ -331,11 +335,11 @@ impl State {
                 }
             }
             "thread/goal/updated" => {
-                self.goal_update(sid, p.get("goal"), out);
+                self.goal_update(sid, p.get("goal"), false, out);
                 self.goal_changed(sid, out);
             }
             "thread/goal/cleared" => {
-                self.goal_update(sid, None, out);
+                self.goal_update(sid, None, false, out);
                 self.goal_changed(sid, out);
             }
             "turn/completed" => self.turn_completed(sid, p.get("turn").unwrap_or(&Value::Null), out),

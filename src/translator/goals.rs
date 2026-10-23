@@ -3,12 +3,22 @@ use super::*;
 
 impl State {
     pub(super) fn read_goal(&mut self, sid: &str, out: &mut Vec<Out>) {
-        out.push(self.send(Pending::GoalRead { thread: sid.into() }, "thread/goal/get", json!({"threadId": sid})));
+        let version = self.threads.get(sid).map_or(0, |t| t.goal_version);
+        out.push(self.send(
+            Pending::GoalRead { thread: sid.into(), version },
+            "thread/goal/get",
+            json!({"threadId": sid}),
+        ));
     }
 
-    pub(super) fn goal_update(&mut self, sid: &str, goal: Option<&Value>, out: &mut Vec<Out>) {
+    pub(super) fn goal_update(&mut self, sid: &str, goal: Option<&Value>, force: bool, out: &mut Vec<Out>) {
         let Some(t) = self.threads.get_mut(sid) else { return };
-        t.goal = goal.filter(|v| v.is_object()).cloned();
+        let next = goal.filter(|v| v.is_object()).cloned();
+        if !force && t.goal == next {
+            return;
+        }
+        t.goal = next;
+        t.goal_version += 1;
         out.push(update(sid, json!({"sessionUpdate": "session_info_update", "_meta": {"goal": t.goal}})));
     }
 

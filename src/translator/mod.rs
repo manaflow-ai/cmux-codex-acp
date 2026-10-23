@@ -102,6 +102,7 @@ enum Pending {
     },
     GoalRead {
         thread: String,
+        version: u64,
     },
     GoalSend {
         client: Value,
@@ -213,6 +214,7 @@ struct Thread {
     goal_prompt: Option<Value>,
     /// Codex owns and persists the goal; this is only its last reported state.
     goal: Option<Value>,
+    goal_version: u64,
     /// A collaboration mode change waits for Codex.
     collab_pending: bool,
     /// A command turn was cancelled before it started: the next `turn/started`
