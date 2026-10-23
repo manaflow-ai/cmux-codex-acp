@@ -6,6 +6,8 @@ mod commands;
 mod history;
 mod requests;
 mod server;
+#[cfg(test)]
+mod goal_speed_tests;
 
 use crate::config::{self, ModelInfo};
 use serde_json::{Value, json};
