@@ -8,6 +8,7 @@ bad = 0
 # - the node adapter re-reads skills/list before every prompt; the bridge on session open and skills/changed.
 # - a command approval's title: the bridge names the command, the adapter says "Run command".
 # - the generated title arrives asynchronously in both: compared across the run, not per step.
+# - the bridge reads the persisted goal on session open; an empty goal can arrive with the first prompt.
 GEN = "Greeting from the oracle"
 def gen_titles(d):
     return sorted(t for st in d["steps"].values() for t in st.get("titles", []) if t == GEN)
@@ -18,6 +19,8 @@ def norm_step(st, step):
     if step != "/skills":
         st["calls"] = [c for c in st.get("calls", []) if not c.startswith("skills/list")]
     st["permissions"] = [p if p == "Implement this plan?" else "<tool approval>" for p in st.get("permissions", [])]
+    if step == "first prompt (fallback title)" and st.get("goal_updates") == [None]:
+        st["goal_updates"] = []
     return st
 o["config_ids"] = sorted(o.get("config_ids") or []); c["config_ids"] = sorted(c.get("config_ids") or [])
 o["generated_titles"] = gen_titles(o); c["generated_titles"] = gen_titles(c)

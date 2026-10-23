@@ -619,14 +619,8 @@ impl State {
                 out.push(self.send(pending, "turn/start", params));
             }
             CommandWait::GoalUpdate => {
-                // Nothing changed (`cleared: false`): no update will come.
-                if r.get("cleared") == Some(&Value::Bool(false)) {
-                    return done(out);
-                }
-                match self.threads.get_mut(&sid) {
-                    Some(t) => t.goal_prompt = Some(client),
-                    None => done(out),
-                }
+                // The RPC result confirms persistence. The notification may already have arrived.
+                done(out);
             }
         }
     }
