@@ -26,6 +26,7 @@ mod config;
 mod content;
 mod items;
 mod patch;
+mod speed;
 mod translator;
 
 pub use translator::{Options, Out, Translator};

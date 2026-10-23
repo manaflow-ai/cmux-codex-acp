@@ -371,7 +371,11 @@ impl State {
                 }
                 let params =
                     json!({"threadId": sid, "input": [{"type": "text", "text": IMPLEMENT_PLAN, "text_elements": []}]});
-                out.push(self.send(Pending::TurnStart { client, thread: sid.to_owned() }, "turn/start", params));
+                out.push(self.send(
+                    Pending::TurnStart { client, thread: sid.to_owned(), input: None },
+                    "turn/start",
+                    params,
+                ));
             }
         }
     }
@@ -417,7 +421,7 @@ impl State {
                 };
                 self.begin_command_turn(id, sid);
                 let params = json!({"threadId": sid, "target": target, "delivery": "inline"});
-                let pending = Pending::TurnStart { client: id.clone(), thread: sid.to_owned() };
+                let pending = Pending::TurnStart { client: id.clone(), thread: sid.to_owned(), input: None };
                 out.push(self.send(pending, "review/start", params));
             }
             "status" => wait(self, CommandWait::StatusAccount, "account/read", json!({"refreshToken": false}), out),
@@ -615,14 +619,13 @@ impl State {
                 out.push(self.send(pending, "turn/start", params));
             }
             CommandWait::GoalUpdate => {
-                // Nothing changed (`cleared: false`): no update will come.
-                if r.get("cleared") == Some(&Value::Bool(false)) {
-                    return done(out);
+                // The RPC result confirms persistence. The notification may already have arrived.
+                if let Some(goal) = r.get("goal") {
+                    self.goal_update(&sid, Some(goal), false, out);
+                } else if r.get("cleared") == Some(&Value::Bool(true)) {
+                    self.goal_update(&sid, None, false, out);
                 }
-                match self.threads.get_mut(&sid) {
-                    Some(t) => t.goal_prompt = Some(client),
-                    None => done(out),
-                }
+                done(out);
             }
         }
     }

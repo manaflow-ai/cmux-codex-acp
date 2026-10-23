@@ -88,6 +88,8 @@ pub struct ModelInfo {
     /// What the model takes as input (`inputModalities`: `text`, `image`,
     /// `audio`); empty when the app-server does not say.
     pub input_modalities: Vec<String>,
+    pub service_tiers: Vec<Value>,
+    pub default_service_tier: Option<String>,
 }
 
 impl ModelInfo {
@@ -126,6 +128,8 @@ pub fn parse_models(result: &Value) -> Vec<ModelInfo> {
                 .flatten()
                 .filter_map(|v| v.as_str().map(str::to_owned))
                 .collect(),
+            service_tiers: crate::speed::model_tiers(m),
+            default_service_tier: m.get("defaultServiceTier").and_then(Value::as_str).map(str::to_owned),
         })
         .collect()
 }

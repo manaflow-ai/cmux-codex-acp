@@ -73,8 +73,9 @@ impl State {
                     out.push(Out::Client(err(&id, INTERNAL, self.init_failed.clone().unwrap_or_default())));
                 }
             }
-            Pending::ModelList | Pending::Ignore => {}
-            Pending::TurnStart { client, thread } => {
+            Pending::ModelList | Pending::Ignore | Pending::GoalRead { .. } => {}
+            Pending::TurnStart { client, thread, input } => {
+                let recover = self.has_active_goal(&thread) && goals::busy_refusal(&message);
                 if let Some(t) = self.threads.get_mut(&thread) {
                     t.prompt = None;
                     t.starting = false;
@@ -85,8 +86,12 @@ impl State {
                         out.push(Out::Client(err(&steer, INTERNAL, crate::STEER_NO_TURN)));
                     }
                 }
+                if recover && let Some(input) = input {
+                    return self.reconcile_goal_send(client, thread, input, out);
+                }
                 out.push(Out::Client(err(&client, code, message)));
             }
+            Pending::GoalSend { client, .. } => out.push(Out::Client(err(&client, code, message))),
             Pending::TurnSteer { client } => {
                 // The turn ended (or moved on) before the steer reached it.
                 let lower = message.to_lowercase();
@@ -140,6 +145,7 @@ impl State {
                     let extra = json!({"_meta": {"codexAppServer": {"threadPath": r.pointer("/thread/path"), "cliVersion": r.pointer("/thread/cliVersion"), "model": r.get("model")}}});
                     out.push(Out::Client(ok(&client, self.session_result(&sid, extra))));
                     self.publish_commands(&sid, out);
+                    self.read_goal(&sid, out);
                 }
                 None => out.push(Out::Client(err(&client, INTERNAL, "thread/start returned no thread"))),
             },
@@ -178,12 +184,14 @@ impl State {
                 }
                 out.push(Out::Client(ok(&client, self.session_result(&sid, json!({})))));
                 self.publish_commands(&sid, out);
+                self.read_goal(&sid, out);
             }
             Pending::ThreadFork { client, mode, titles } => match self.adopt_thread(r, mode, None) {
                 Some(sid) => {
                     self.title_choice(&sid, titles);
                     out.push(Out::Client(ok(&client, self.session_result(&sid, json!({})))));
                     self.publish_commands(&sid, out);
+                    self.read_goal(&sid, out);
                 }
                 None => out.push(Out::Client(err(&client, INTERNAL, "thread/fork returned no thread"))),
             },
@@ -205,7 +213,7 @@ impl State {
                     .collect();
                 out.push(Out::Client(ok(&client, json!({"sessions": sessions, "nextCursor": r.get("nextCursor")}))));
             }
-            Pending::TurnStart { client: _, thread } => {
+            Pending::TurnStart { client: _, thread, .. } => {
                 let turn = r.pointer("/turn/id").and_then(Value::as_str).map(str::to_owned);
                 let Some(t) = self.threads.get_mut(&thread) else { return };
                 // The turn may have started and ended before this answer: then
@@ -235,6 +243,14 @@ impl State {
             Pending::TurnSteer { client } => out.push(Out::Client(ok(&client, json!({"stopReason": "steered"})))),
             Pending::Ack { client } => out.push(Out::Client(ok(&client, json!({})))),
             Pending::Command { client, thread, wait } => self.command_result(client, thread, wait, r, out),
+            Pending::GoalRead { thread, version } => {
+                if self.threads.get(&thread).is_some_and(|t| t.goal_version == version) {
+                    self.goal_update(&thread, r.get("goal"), true, out);
+                }
+            }
+            Pending::GoalSend { client, thread, input } => {
+                self.steer_goal_send(client, &thread, input, &r["thread"], out)
+            }
             Pending::Ignore => {}
         }
     }
@@ -319,14 +335,11 @@ impl State {
                 }
             }
             "thread/goal/updated" => {
-                out.push(update(
-                    sid,
-                    json!({"sessionUpdate": "session_info_update", "_meta": {"goal": p.get("goal")}}),
-                ));
+                self.goal_update(sid, p.get("goal"), false, out);
                 self.goal_changed(sid, out);
             }
             "thread/goal/cleared" => {
-                out.push(update(sid, json!({"sessionUpdate": "session_info_update", "_meta": {"goal": null}})));
+                self.goal_update(sid, None, false, out);
                 self.goal_changed(sid, out);
             }
             "turn/completed" => self.turn_completed(sid, p.get("turn").unwrap_or(&Value::Null), out),
