@@ -371,7 +371,11 @@ impl State {
                 }
                 let params =
                     json!({"threadId": sid, "input": [{"type": "text", "text": IMPLEMENT_PLAN, "text_elements": []}]});
-                out.push(self.send(Pending::TurnStart { client, thread: sid.to_owned() }, "turn/start", params));
+                out.push(self.send(
+                    Pending::TurnStart { client, thread: sid.to_owned(), input: None },
+                    "turn/start",
+                    params,
+                ));
             }
         }
     }
@@ -417,7 +421,7 @@ impl State {
                 };
                 self.begin_command_turn(id, sid);
                 let params = json!({"threadId": sid, "target": target, "delivery": "inline"});
-                let pending = Pending::TurnStart { client: id.clone(), thread: sid.to_owned() };
+                let pending = Pending::TurnStart { client: id.clone(), thread: sid.to_owned(), input: None };
                 out.push(self.send(pending, "review/start", params));
             }
             "status" => wait(self, CommandWait::StatusAccount, "account/read", json!({"refreshToken": false}), out),

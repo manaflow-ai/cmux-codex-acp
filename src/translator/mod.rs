@@ -3,11 +3,12 @@
 
 mod client;
 mod commands;
+#[cfg(test)]
+mod goal_speed_tests;
+mod goals;
 mod history;
 mod requests;
 mod server;
-#[cfg(test)]
-mod goal_speed_tests;
 
 use crate::config::{self, ModelInfo};
 use serde_json::{Value, json};
@@ -96,6 +97,16 @@ enum Pending {
     TurnStart {
         client: Value,
         thread: String,
+        /// Kept until acceptance, so a goal that starts first cannot lose the message.
+        input: Option<Value>,
+    },
+    GoalRead {
+        thread: String,
+    },
+    GoalSend {
+        client: Value,
+        thread: String,
+        input: Value,
     },
     TurnSteer {
         client: Value,
@@ -158,6 +169,7 @@ struct Thread {
     applied_mode: String,
     model: String,
     effort: String,
+    service_tier: Option<String>,
     /// The running turn.
     turn: Option<String>,
     /// The ACP request of the running turn's own prompt.
@@ -199,6 +211,8 @@ struct Thread {
     plan_review: Option<(Value, String)>,
     /// A `/goal pause` or `/goal clear` prompt, answered with the goal's update.
     goal_prompt: Option<Value>,
+    /// Codex owns and persists the goal; this is only its last reported state.
+    goal: Option<Value>,
     /// A collaboration mode change waits for Codex.
     collab_pending: bool,
     /// A command turn was cancelled before it started: the next `turn/started`
@@ -367,6 +381,7 @@ impl Translator {
                 | Pending::ThreadFork { client, .. }
                 | Pending::ThreadList { client }
                 | Pending::TurnSteer { client }
+                | Pending::GoalSend { client, .. }
                 | Pending::Ack { client }
                 | Pending::Command { client, .. }
                 | Pending::TurnStart { client, .. } => fail(&client, &mut out),
@@ -460,6 +475,11 @@ impl State {
         );
         if let Some(list) = options.as_array_mut() {
             list.push(self.collaboration_option(thread));
+            if let Some(model) = self.models.iter().find(|m| m.id == self.model_of(thread))
+                && let Some(speed) = crate::speed::option(model, t.and_then(|t| t.service_tier.as_deref()))
+            {
+                list.push(speed);
+            }
         }
         options
     }
@@ -529,6 +549,7 @@ impl State {
         t.mode = mode;
         t.model = model;
         t.effort = effort;
+        t.service_tier = result.get("serviceTier").and_then(Value::as_str).map(str::to_owned);
         Some(id)
     }
 }

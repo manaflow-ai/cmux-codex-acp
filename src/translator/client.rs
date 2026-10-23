@@ -213,6 +213,13 @@ impl State {
             "model" => {
                 let (model, effort) = config::split_model(value, &models);
                 t.model = model;
+                if t.service_tier.as_deref().is_some_and(|tier| tier != crate::speed::STANDARD)
+                    && models.iter().find(|m| m.id == t.model).is_none_or(|m| {
+                        !m.service_tiers.iter().any(|tier| tier["value"].as_str() == t.service_tier.as_deref())
+                    })
+                {
+                    t.service_tier = Some(crate::speed::STANDARD.into());
+                }
                 if let Some(e) = effort {
                     t.effort = e;
                 }
@@ -227,6 +234,18 @@ impl State {
             }
             "reasoning_effort" | "effort" | "thought_level" => {
                 t.effort = value.to_owned();
+                Ok(())
+            }
+            "fast-mode" | "service_tier" => {
+                if value != crate::speed::STANDARD
+                    && !models
+                        .iter()
+                        .find(|m| m.id == t.model)
+                        .is_some_and(|m| m.service_tiers.iter().any(|tier| tier["value"] == value))
+                {
+                    return Err(format!("service tier {value:?} is not offered by this model"));
+                }
+                t.service_tier = Some(value.into());
                 Ok(())
             }
             other => Err(format!("unknown config option {other:?}")),
@@ -344,6 +363,26 @@ impl State {
             }
             return;
         }
+        // A goal continuation has no outstanding ACP prompt. A normal message to that live
+        // session is steering input, not a request to start a second turn.
+        if t.prompt.is_none() && !t.starting && self.has_active_goal(&sid) {
+            if let Some((name, rest)) = commands::parse(&blocks)
+                && name == "goal"
+                && matches!(rest.to_ascii_lowercase().as_str(), "pause" | "clear")
+                && self.command(&id, &sid, &name, &rest, out)
+            {
+                return;
+            }
+            if let Some(turn) = self.threads.get(&sid).and_then(|t| t.turn.clone()) {
+                out.extend(notice);
+                return out.push(self.send(
+                    Pending::TurnSteer { client: id },
+                    "turn/steer",
+                    json!({"threadId": sid, "expectedTurnId": turn, "input": input}),
+                ));
+            }
+        }
+        let t = self.threads.get(&sid).expect("checked above");
         if t.turn.is_some() || t.starting || t.plan_review.is_some() || t.goal_prompt.is_some() {
             return out.push(Out::Client(err(&id, INTERNAL, "a turn is already running in this session")));
         }
@@ -369,6 +408,9 @@ impl State {
         if t.effort != config::DEFAULT_EFFORT && !t.effort.is_empty() {
             params["effort"] = json!(t.effort);
         }
+        if let Some(tier) = &t.service_tier {
+            params["serviceTier"] = json!(tier);
+        }
         let usage = t.usage.clone();
         let first_title = commands::title_of(&blocks);
         let t = self.threads.get_mut(&sid).expect("checked above");
@@ -385,7 +427,8 @@ impl State {
         t.starting = true;
         t.cancel_pending = false;
         t.usage_at_start = usage;
-        out.push(self.send(Pending::TurnStart { client: id, thread: sid }, "turn/start", params));
+        let input = params.get("input").cloned();
+        out.push(self.send(Pending::TurnStart { client: id, thread: sid, input }, "turn/start", params));
     }
 
     /// Interrupts the session's turn and its subagents' turns.
