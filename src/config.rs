@@ -56,6 +56,45 @@ pub fn mode(id: &str) -> Option<&'static Mode> {
     MODES.iter().find(|m| m.id == id)
 }
 
+/// The permission profile `read-only` selects on an app-server that has it
+/// ([`READ_ONLY_PROFILE_VERSION`]): Codex's `:read-only` plus one deny entry.
+/// Its id is [`READ_ONLY_PROFILE`] plus a random suffix per translator, so no
+/// profile of the user's or a project's config can merge grants into it.
+///
+/// A command that a Codex rule (`~/.codex/rules`) explicitly allows skips the
+/// approval prompt, and with the plain `read-only` sandbox mode it also runs
+/// outside the sandbox. A profile with a deny entry keeps every command in the
+/// sandbox (Codex's `unsandboxed_execution_allowed`), so the rule skips only
+/// the prompt. The entry is a glob under a folder that does not exist: it
+/// hides nothing, and Linux's bubblewrap skips a glob with no matches (a
+/// missing exact path would be mounted over, and fail, in an escalated run).
+///
+/// Codex keeps a deny entry for the rest of the thread: after `read-only`,
+/// `ask` and `agent` also run rules-allowed commands in their sandbox, and an
+/// approved escalation there writes anywhere but has no network.
+/// `agent-full-access` drops it.
+pub const READ_ONLY_PROFILE: &str = "cmux-read-only";
+const READ_ONLY_PROFILE_DENY: &str = "/nonexistent-cmux-codex-acp/*";
+
+/// The first app-server in which a profile's deny entry keeps a
+/// rules-allowed command in the sandbox. An older one gets the `read-only`
+/// sandbox mode.
+pub const READ_ONLY_PROFILE_VERSION: (u64, u64, u64) = (0, 136, 0);
+
+/// A fresh id for the read-only profile.
+pub fn read_only_profile_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    // `RandomState` is seeded from the OS's randomness.
+    let random = std::collections::hash_map::RandomState::new().build_hasher().finish();
+    format!("{READ_ONLY_PROFILE}-{random:016x}")
+}
+
+/// The `config` entry that defines the read-only profile `id`. Every thread
+/// gets it, so a later turn can switch into `read-only`.
+pub fn read_only_profile(id: &str) -> (String, Value) {
+    (format!("permissions.{id}"), json!({"extends": ":read-only", "filesystem": {READ_ONLY_PROFILE_DENY: "deny"}}))
+}
+
 /// `SandboxPolicy` for `turn/start` (the per-turn override takes the policy
 /// form, not the mode name).
 pub fn sandbox_policy(mode: &Mode) -> Value {

@@ -109,6 +109,14 @@ enum Pending {
         thread: String,
         input: Value,
     },
+    /// A busy start raced the initial goal read: confirm the goal before steering.
+    GoalSendCheck {
+        client: Value,
+        thread: String,
+        input: Value,
+        version: u64,
+        error: Value,
+    },
     TurnSteer {
         client: Value,
     },
@@ -121,6 +129,13 @@ enum Pending {
         client: Value,
         thread: String,
         wait: commands::CommandWait,
+    },
+    /// `thread/settings/update` of a session's mode, the thread's `nth`:
+    /// on an error of the latest one the mode counts as not applied, so the
+    /// next turn sends it again. An older one's answer changes nothing.
+    ModeApply {
+        thread: String,
+        nth: u64,
     },
     /// Fire and forget (`turn/interrupt`, `thread/unsubscribe` on close).
     Ignore,
@@ -168,6 +183,8 @@ struct Thread {
     /// only when `mode` differs, so the user's own sandbox settings (extra
     /// writable roots, network) stay in force otherwise.
     applied_mode: String,
+    /// How many mode updates were sent (`Pending::ModeApply::nth`).
+    mode_gen: u64,
     model: String,
     effort: String,
     service_tier: Option<String>,
@@ -224,6 +241,10 @@ struct Thread {
     ignore_turn: Option<String>,
     /// The title was generated (or asked for) once.
     title_generated: bool,
+    /// Work that waits for Codex to take the session's mode (a review, a
+    /// goal, a plan's implementation): sent once the mode update succeeds,
+    /// failed with its error when it fails (`send_in_mode`).
+    after_mode: Vec<(Pending, String, Value)>,
     /// The running prompt's text, for the title thread.
     prompt_text: Option<String>,
 }
@@ -248,6 +269,8 @@ struct State {
     account: Option<Value>,
     /// Ephemeral title threads: thread id -> (session, agent text so far).
     title_threads: HashMap<String, (String, String)>,
+    /// The id of the permission profile `read-only` selects (`config::read_only_profile_id`).
+    read_only_profile: String,
 }
 
 /// The first Codex app-server whose `turn/start` takes `{"type": "audio"}` input.
@@ -263,6 +286,112 @@ fn agent_version(user_agent: &str) -> Option<(u64, u64, u64)> {
 }
 
 impl State {
+    /// Whether `read-only` selects [`config::READ_ONLY_PROFILE`] on this
+    /// app-server: yes unless its version is known to predate it.
+    pub(super) fn read_only_profile(&self) -> bool {
+        self.user_agent.as_deref().and_then(agent_version).is_none_or(|v| v >= config::READ_ONLY_PROFILE_VERSION)
+    }
+
+    /// The sandbox fields of `mode` for a request: `permissions` (the
+    /// read-only profile) or `key` (`sandbox` for a thread request, the
+    /// `sandboxPolicy` form for a turn or settings update).
+    pub(super) fn mode_sandbox(&self, mode: &config::Mode, key: &str, params: &mut Value) {
+        if mode.id == "read-only" && self.read_only_profile() {
+            params["permissions"] = json!(self.read_only_profile);
+        } else if key == "sandbox" {
+            params["sandbox"] = json!(mode.sandbox);
+        } else {
+            params[key] = config::sandbox_policy(mode);
+        }
+    }
+
+    /// A thread's `config`: `base` (the MCP servers) and the read-only profile.
+    pub(super) fn thread_config(&self, base: Option<Value>, params: &mut Value) {
+        let mut cfg = base.unwrap_or_else(|| json!({}));
+        if self.read_only_profile() {
+            let (key, value) = config::read_only_profile(&self.read_only_profile);
+            cfg[key] = value;
+        }
+        if cfg.as_object().is_some_and(|c| !c.is_empty()) {
+            params["config"] = cfg;
+        }
+    }
+
+    /// Whether a `thread/start`, `thread/resume` or `thread/fork` result shows
+    /// Codex running the thread read-only: in the profile (or, on an older
+    /// app-server, the read-only sandbox).
+    pub(super) fn result_read_only(&self, r: &Value) -> bool {
+        if self.read_only_profile() {
+            r.pointer("/activePermissionProfile/id").and_then(Value::as_str) == Some(self.read_only_profile.as_str())
+        } else {
+            r.pointer("/sandbox/type").and_then(Value::as_str) == Some("readOnly")
+        }
+    }
+
+    /// After a thread's start, resume or fork: a read-only session that Codex
+    /// does not run read-only is moved into it. Codex ignores a resume's
+    /// overrides for a thread it still has loaded, and managed requirements
+    /// can make it start a thread in another profile with no error. Only
+    /// read-only is checked: this never moves a thread to a wider mode than
+    /// Codex has it in.
+    pub(super) fn settle_read_only(&mut self, sid: &str, r: &Value, out: &mut Vec<Out>) {
+        if self.threads.get(sid).is_none_or(|t| t.mode != "read-only") || self.result_read_only(r) {
+            return;
+        }
+        if let Some(t) = self.threads.get_mut(sid) {
+            t.applied_mode.clear();
+        }
+        self.apply_mode(sid, out);
+    }
+
+    /// Sends `method` once Codex has the session's mode: now when it has it,
+    /// else after the mode update (`apply_mode`) succeeds. One that fails
+    /// fails this request too, so nothing starts in the previous mode.
+    pub(super) fn send_in_mode(
+        &mut self,
+        sid: &str,
+        pending: Pending,
+        method: &str,
+        params: Value,
+        out: &mut Vec<Out>,
+    ) {
+        self.apply_mode(sid, out);
+        if self.threads.contains_key(sid) && !self.mode_settled(sid) {
+            self.threads.get_mut(sid).expect("checked above").after_mode.push((pending, method.to_owned(), params));
+        } else {
+            out.push(self.send(pending, method, params));
+        }
+    }
+
+    /// Whether Codex has the session's mode: it took it, and no update of it
+    /// is still on its way (one that fails would leave the old mode).
+    pub(super) fn mode_settled(&self, sid: &str) -> bool {
+        self.threads.get(sid).is_some_and(|t| t.mode == t.applied_mode) && !self.mode_on_its_way(sid)
+    }
+
+    /// Whether a mode update of the thread awaits Codex's answer.
+    pub(super) fn mode_on_its_way(&self, sid: &str) -> bool {
+        self.pending.values().any(|p| matches!(p, Pending::ModeApply { thread, .. } if thread == sid))
+    }
+
+    /// Sends the session's mode to Codex now when Codex does not have it
+    /// yet and no update of it is on its way, so whatever runs next (a turn,
+    /// a review, a goal's turns) runs in it.
+    pub(super) fn apply_mode(&mut self, sid: &str, out: &mut Vec<Out>) {
+        let Some(t) = self.threads.get(sid) else { return };
+        if t.mode == t.applied_mode {
+            return;
+        }
+        let Some(mode) = config::mode(&t.mode) else { return };
+        let mut params = json!({"threadId": sid, "approvalPolicy": mode.approval});
+        self.mode_sandbox(mode, "sandboxPolicy", &mut params);
+        let t = self.threads.get_mut(sid).expect("checked above");
+        t.applied_mode = t.mode.clone();
+        t.mode_gen += 1;
+        let pending = Pending::ModeApply { thread: sid.to_owned(), nth: t.mode_gen };
+        out.push(self.send(pending, "thread/settings/update", params));
+    }
+
     /// Whether this app-server takes audio input: the caller opted in and the
     /// server's version is known to accept it.
     pub(super) fn audio_input(&self) -> bool {
@@ -325,6 +454,7 @@ impl Translator {
                 user_agent: None,
                 account: None,
                 title_threads: HashMap::new(),
+                read_only_profile: config::read_only_profile_id(),
             }),
         }
     }
@@ -384,6 +514,7 @@ impl Translator {
                 | Pending::ThreadList { client }
                 | Pending::TurnSteer { client }
                 | Pending::GoalSend { client, .. }
+                | Pending::GoalSendCheck { client, .. }
                 | Pending::Ack { client }
                 | Pending::Command { client, .. }
                 | Pending::TurnStart { client, .. } => fail(&client, &mut out),
@@ -391,6 +522,8 @@ impl Translator {
             }
         }
         for t in st.threads.values_mut() {
+            // Their prompts are failed below.
+            t.after_mode.clear();
             if let Some((ask, _)) = t.plan_review.take() {
                 out.push(Out::Client(notification("$/cancel_request", json!({"requestId": ask}))));
             }
@@ -774,3 +907,6 @@ mod tests {
         assert!(model[1].get("_meta").is_none());
     }
 }
+
+#[cfg(test)]
+mod sandbox_tests;

@@ -45,9 +45,28 @@ built from the decisions Codex offers for that request.
 | `agent` (default) | on-request | workspace-write |
 | `agent-full-access` | never | danger-full-access |
 
+A command that a Codex rule (`~/.codex/rules`) explicitly allows runs without
+asking in every mode. In `read-only` it still runs inside the read-only
+sandbox: the mode selects a permission profile, `cmux-read-only-<random>`
+(Codex's `:read-only` plus a deny entry that hides nothing; the random suffix
+keeps any other config from adding to it), and Codex keeps every command of a
+profile with a deny entry in the sandbox. With Codex older than 0.136.0 the
+mode is the plain read-only sandbox, where a rules-allowed command runs outside
+it. Codex keeps the deny entry for the rest of the session: after `read-only`,
+`ask` and `agent` also run rules-allowed commands in their sandbox, and an
+approved escalation there writes anywhere but has no network;
+`agent-full-access` drops it. A read-only thread Codex starts, resumes or
+forks in another profile (managed requirements can do that without an error)
+is moved into this one, and fails to run if Codex refuses. The thread that
+writes a session's title runs in the same profile and asks nothing; if Codex
+starts it elsewhere, no title is written.
+
 Config options: `model` (from `model/list`), `reasoning_effort` (the model's
-supported efforts), `mode`. A change applies from the next turn: Codex takes
-model, effort, approval policy and sandbox per turn.
+supported efforts), `mode`. A mode change goes to Codex at once
+(`thread/settings/update`). A review, a goal or a plan's implementation
+started next waits until Codex has taken it, and fails if Codex refuses it; a
+prompt carries the mode itself. A model or effort change goes with the next
+turn.
 
 ## ACP coverage
 
@@ -63,7 +82,7 @@ model, effort, approval policy and sandbox per turn.
 | `session/prompt` | `turn/start`; answered at `turn/completed` with the turn's token usage |
 | `session/prompt` with `_meta.steer` | `turn/steer` into the running turn; answered `steered` |
 | `session/cancel` | `turn/interrupt` for the session and its running subagents |
-| `session/set_mode`, `set_model`, `set_config_option` | per-turn overrides on the next `turn/start` |
+| `session/set_mode`, `set_model`, `set_config_option` | a mode: `thread/settings/update`; a model or effort: overrides on the next `turn/start` |
 
 Prompt content: text, images (data or file URI), resource links (as
 `@path` mentions), embedded resources (quoted with their path).
@@ -72,7 +91,7 @@ Prompt content: text, images (data or file URI), resource links (as
 
 Requests the translator sends: `initialize`, `model/list`, `thread/start`,
 `thread/resume`, `thread/fork`, `thread/list`, `thread/unsubscribe`,
-`turn/start`, `turn/steer`, `turn/interrupt`.
+`thread/settings/update`, `turn/start`, `turn/steer`, `turn/interrupt`.
 
 Notifications:
 

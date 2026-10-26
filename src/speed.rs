@@ -5,7 +5,10 @@ use serde_json::{Value, json};
 pub(crate) const STANDARD: &str = "default";
 
 pub(crate) fn model_tiers(model: &Value) -> Vec<Value> {
-    let source = model.get("serviceTiers").or_else(|| model.get("additionalSpeedTiers"));
+    let source = model
+        .get("serviceTiers")
+        .filter(|tiers| tiers.as_array().is_some_and(|tiers| !tiers.is_empty()))
+        .or_else(|| model.get("additionalSpeedTiers"));
     source
         .and_then(Value::as_array)
         .into_iter()

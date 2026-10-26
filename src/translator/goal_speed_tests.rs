@@ -80,13 +80,106 @@ fn a_goal_continuation_winning_the_send_race_preserves_the_input() {
 
 #[test]
 fn an_unrelated_start_error_is_never_replayed() {
+    for (code, message) in [(-32600, "model is unavailable"), (-32603, "thread already has an active turn")] {
+        let translator = setup();
+        active_goal(&translator);
+        let start = request(send(&translator), "turn/start");
+        let outs = translator.from_server(&json!({"id": start["id"], "error": {"code": code, "message": message}}));
+        assert!(outs.iter().all(|out| matches!(out, Out::Client(_))));
+    }
+}
+
+#[test]
+fn a_repeated_clear_invalidates_an_older_goal_snapshot() {
     let translator = setup();
-    active_goal(&translator);
-    let start = request(send(&translator), "turn/start");
-    let outs = translator.from_server(&json!({"id": start["id"], "error": {
-        "code": -32600, "message": "model is unavailable"
+    let mut outs = Vec::new();
+    translator.lock().read_goal("t", &mut outs);
+    let read = request(outs, "thread/goal/get");
+    tell(&translator, "thread/goal/cleared", json!({"threadId": "t"}));
+    let outs = translator.from_server(&json!({"id": read["id"], "result": {
+        "goal": {"status": "active", "objective": "Old task"}
     }}));
-    assert!(outs.iter().all(|out| matches!(out, Out::Client(_))));
+    assert!(outs.is_empty());
+    assert!(translator.lock().threads["t"].goal.is_none());
+}
+
+#[test]
+fn a_busy_start_before_the_initial_goal_read_finishes_confirms_the_goal_then_steers() {
+    for initial_reply_first in [true, false] {
+        let translator = setup();
+        let mut outs = Vec::new();
+        translator.lock().read_goal("t", &mut outs);
+        let initial = request(outs, "thread/goal/get");
+        let start = request(send(&translator), "turn/start");
+        let check = request(
+            translator.from_server(&json!({"id": start["id"], "error": {
+                "code": -32600, "message": "thread already has an active turn"
+            }})),
+            "thread/goal/get",
+        );
+        let old = json!({"id": initial["id"], "result": {"goal": null}});
+        if initial_reply_first {
+            assert!(translator.from_server(&old).is_empty());
+        }
+        let read = request(
+            translator.from_server(&json!({"id": check["id"], "result": {"goal": {"status": "active"}}})),
+            "thread/read",
+        );
+        if !initial_reply_first {
+            assert!(translator.from_server(&old).is_empty());
+        }
+        let steer = request(
+            translator.from_server(&json!({"id": read["id"], "result": {
+                "thread": {"turns": [{"id": "auto-3", "status": "inProgress"}]}
+            }})),
+            "turn/steer",
+        );
+        assert_eq!(steer["params"]["input"], start["params"]["input"]);
+        assert_eq!(steer["params"]["expectedTurnId"], "auto-3");
+    }
+}
+
+#[test]
+fn a_cancel_during_goal_send_recovery_never_steers_afterwards() {
+    for cancel_before_refusal in [true, false] {
+        let translator = setup();
+        active_goal(&translator);
+        let start = request(send(&translator), "turn/start");
+        let cancel = json!({"method": "session/cancel", "params": {"sessionId": "t"}});
+        if cancel_before_refusal {
+            translator.from_client(&cancel);
+        }
+        let outs = translator.from_server(&json!({"id": start["id"], "error": {
+            "code": -32600, "message": "thread already has an active turn"
+        }}));
+        if cancel_before_refusal {
+            assert!(
+                outs.iter().any(|out| matches!(out, Out::Client(msg) if msg["result"]["stopReason"] == "cancelled"))
+            );
+            assert!(outs.iter().all(|out| matches!(out, Out::Client(_))));
+        } else {
+            let read = request(outs, "thread/read");
+            let cancelled = translator.from_client(&cancel);
+            assert!(
+                cancelled
+                    .iter()
+                    .any(|out| matches!(out, Out::Client(msg) if msg["result"]["stopReason"] == "cancelled"))
+            );
+            assert!(
+                translator
+                    .from_server(&json!({"id": read["id"], "result": {
+                        "thread": {"turns": [{"id": "auto-4", "status": "inProgress"}]}
+                    }}))
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn empty_service_tiers_fall_back_to_the_advertised_speed_tiers() {
+    let tiers = crate::speed::model_tiers(&json!({"serviceTiers": [], "additionalSpeedTiers": ["fast", "ultrafast"]}));
+    assert_eq!(tiers.iter().map(|tier| tier["value"].as_str().unwrap()).collect::<Vec<_>>(), ["fast", "ultrafast"]);
 }
 
 #[test]

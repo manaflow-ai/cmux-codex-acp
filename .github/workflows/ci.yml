@@ -31,3 +31,18 @@ jobs:
         # The live tests need a codex binary and model access; without
         # CMUX_CODEX_ACP_CODEX they report that and pass.
         run: cargo test --locked --all-targets
+      - name: Codex for the sandbox tests
+        if: ${{ !cancelled() }}
+        # tests/sandbox.rs runs a real `codex app-server` against a local
+        # stand-in for the model: no model access, but Codex's own sandbox
+        # (Seatbelt on macOS; bubblewrap, which needs user namespaces, on Linux).
+        run: |
+          npm install --global @openai/codex@0.164.0
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q bubblewrap
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Sandbox tests
+        if: ${{ !cancelled() }}
+        run: CMUX_CODEX_ACP_CODEX="$(command -v codex)" cargo test --locked --test sandbox

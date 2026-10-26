@@ -74,9 +74,28 @@ impl State {
                 }
             }
             Pending::ModelList | Pending::Ignore | Pending::GoalRead { .. } => {}
+            Pending::ModeApply { thread, nth } => {
+                // The latest update refused: the next turn sends the mode with
+                // it, and work that waited for it fails. An older one refused
+                // changes nothing; the newer one decides.
+                let waiting = match self.threads.get_mut(&thread) {
+                    Some(t) if t.mode_gen == nth => {
+                        t.applied_mode.clear();
+                        std::mem::take(&mut t.after_mode)
+                    }
+                    _ => Vec::new(),
+                };
+                for (pending, _, _) in waiting {
+                    self.server_error(pending, e, out);
+                }
+            }
             Pending::TurnStart { client, thread, input } => {
-                let recover = self.has_active_goal(&thread) && goals::busy_refusal(&message);
+                let recover = goals::busy_refusal(code, &message);
+                let goal_read_pending =
+                    self.pending.values().any(|p| matches!(p, Pending::GoalRead { thread: sid, .. } if sid == &thread));
+                let mut cancelled = false;
                 if let Some(t) = self.threads.get_mut(&thread) {
+                    cancelled = std::mem::take(&mut t.cancel_pending);
                     t.prompt = None;
                     t.starting = false;
                     t.command_turn = false;
@@ -86,12 +105,30 @@ impl State {
                         out.push(Out::Client(err(&steer, INTERNAL, crate::STEER_NO_TURN)));
                     }
                 }
+                if cancelled {
+                    return out.push(Out::Client(ok(&client, json!({"stopReason": "cancelled"}))));
+                }
                 if recover && let Some(input) = input {
-                    return self.reconcile_goal_send(client, thread, input, out);
+                    if self.has_active_goal(&thread) {
+                        return self.reconcile_goal_send(client, thread, input, out);
+                    }
+                    if goal_read_pending && let Some(t) = self.threads.get_mut(&thread) {
+                        t.goal_version += 1;
+                        let pending = Pending::GoalSendCheck {
+                            client,
+                            thread: thread.clone(),
+                            input,
+                            version: t.goal_version,
+                            error: e.clone(),
+                        };
+                        return out.push(self.send(pending, "thread/goal/get", json!({"threadId": thread})));
+                    }
                 }
                 out.push(Out::Client(err(&client, code, message)));
             }
-            Pending::GoalSend { client, .. } => out.push(Out::Client(err(&client, code, message))),
+            Pending::GoalSend { client, .. } | Pending::GoalSendCheck { client, .. } => {
+                out.push(Out::Client(err(&client, code, message)))
+            }
             Pending::TurnSteer { client } => {
                 // The turn ended (or moved on) before the steer reached it.
                 let lower = message.to_lowercase();
@@ -122,6 +159,14 @@ impl State {
                 out.push(self.send(Pending::ModelList, "model/list", json!({})));
                 self.drain_queued(out);
             }
+            Pending::ModeApply { thread, .. } => {
+                if self.mode_settled(&thread) {
+                    let waiting = self.threads.get_mut(&thread).map(|t| std::mem::take(&mut t.after_mode));
+                    for (pending, method, params) in waiting.unwrap_or_default() {
+                        out.push(self.send(pending, &method, params));
+                    }
+                }
+            }
             Pending::ModelList => {
                 self.models = config::parse_models(r);
                 let default = self.models.iter().find(|m| m.is_default).map(|m| m.id.clone());
@@ -141,6 +186,7 @@ impl State {
             }
             Pending::ThreadStart { client, mode, effort, titles } => match self.adopt_thread(r, mode, Some(effort)) {
                 Some(sid) => {
+                    self.settle_read_only(&sid, r, out);
                     self.title_choice(&sid, titles);
                     let extra = json!({"_meta": {"codexAppServer": {"threadPath": r.pointer("/thread/path"), "cliVersion": r.pointer("/thread/cliVersion"), "model": r.get("model")}}});
                     out.push(Out::Client(ok(&client, self.session_result(&sid, extra))));
@@ -151,9 +197,23 @@ impl State {
             },
             Pending::ThreadResume { client, session, mode, replay, titles } => {
                 let effort = self.threads.get(&session).map(|t| t.effort.clone());
+                // A mode picked while the resume was on its way stays the
+                // session's, and its own update settles it.
+                let picked = self
+                    .threads
+                    .get(&session)
+                    .filter(|t| t.mode != mode || self.mode_on_its_way(&session))
+                    .map(|t| (t.mode.clone(), t.applied_mode.clone()));
                 let Some(sid) = self.adopt_thread(r, mode, effort) else {
                     return out.push(Out::Client(err(&client, INTERNAL, "thread/resume returned no thread")));
                 };
+                if let Some((mode, applied)) = picked.filter(|_| sid == session)
+                    && let Some(t) = self.threads.get_mut(&sid)
+                {
+                    (t.mode, t.applied_mode) = (mode, applied);
+                } else {
+                    self.settle_read_only(&sid, r, out);
+                }
                 self.title_choice(&sid, titles);
                 if replay {
                     self.replay(&sid, r.pointer("/thread/turns"), out);
@@ -188,6 +248,7 @@ impl State {
             }
             Pending::ThreadFork { client, mode, titles } => match self.adopt_thread(r, mode, None) {
                 Some(sid) => {
+                    self.settle_read_only(&sid, r, out);
                     self.title_choice(&sid, titles);
                     out.push(Out::Client(ok(&client, self.session_result(&sid, json!({})))));
                     self.publish_commands(&sid, out);
@@ -249,7 +310,21 @@ impl State {
                 }
             }
             Pending::GoalSend { client, thread, input } => {
-                self.steer_goal_send(client, &thread, input, &r["thread"], out)
+                if self.has_active_goal(&thread) {
+                    self.steer_goal_send(client, &thread, input, &r["thread"], out);
+                } else {
+                    out.push(Out::Client(err(&client, INTERNAL, crate::STEER_NO_TURN)));
+                }
+            }
+            Pending::GoalSendCheck { client, thread, input, version, error } => {
+                if self.threads.get(&thread).is_some_and(|t| t.goal_version == version) {
+                    self.goal_update(&thread, r.get("goal"), false, out);
+                }
+                if self.has_active_goal(&thread) {
+                    self.reconcile_goal_send(client, thread, input, out);
+                } else {
+                    self.server_error(Pending::GoalSend { client, thread, input }, &error, out);
+                }
             }
             Pending::Ignore => {}
         }

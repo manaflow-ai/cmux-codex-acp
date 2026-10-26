@@ -114,7 +114,7 @@ impl State {
                 let (Some(sid), Some(mode)) = (s(&p, "sessionId"), s(&p, "modeId")) else {
                     return out.push(Out::Client(err(&id, INVALID_PARAMS, "sessionId and modeId are required")));
                 };
-                match self.set_mode(sid, mode) {
+                match self.set_mode(sid, mode, out) {
                     Ok(()) => {
                         out.push(Out::Client(ok(&id, json!({}))));
                         out.push(update(sid, json!({"sessionUpdate": "current_mode_update", "currentModeId": mode})));
@@ -166,7 +166,7 @@ impl State {
                     return;
                 }
                 let result = if config_id == "mode" {
-                    self.set_mode(sid, &value)
+                    self.set_mode(sid, &value, out)
                 } else {
                     self.set_option(sid, config_id, &value)
                 };
@@ -195,12 +195,15 @@ impl State {
         }
     }
 
-    fn set_mode(&mut self, sid: &str, mode: &str) -> Result<(), String> {
+    /// A mode pick. Codex gets it at once (`apply_mode`): a review, a goal's
+    /// turns or a plan's implementation started next runs in it too.
+    fn set_mode(&mut self, sid: &str, mode: &str, out: &mut Vec<Out>) -> Result<(), String> {
         if config::mode(mode).is_none() {
             return Err(format!("unknown mode {mode:?}"));
         }
         let t = self.threads.get_mut(sid).ok_or_else(|| format!("unknown session {sid}"))?;
         t.mode = mode.to_owned();
+        self.apply_mode(sid, out);
         Ok(())
     }
 
@@ -254,13 +257,12 @@ impl State {
 
     fn thread_params(&self, p: &Value, mode: &str) -> Value {
         let m = config::mode(mode).unwrap_or(&config::MODES[2]);
-        let mut params = json!({"approvalPolicy": m.approval, "sandbox": m.sandbox});
+        let mut params = json!({"approvalPolicy": m.approval});
+        self.mode_sandbox(m, "sandbox", &mut params);
         if let Some(cwd) = p.get("cwd").filter(|c| c.is_string()) {
             params["cwd"] = cwd.clone();
         }
-        if let Some(cfg) = config::mcp_config(p.get("mcpServers")) {
-            params["config"] = cfg;
-        }
+        self.thread_config(config::mcp_config(p.get("mcpServers")), &mut params);
         params
     }
 
@@ -397,10 +399,10 @@ impl State {
         // Approval and sandbox only when the mode changed: the app-server
         // keeps them per thread, and a sandbox policy sent every turn would
         // drop the user's own sandbox settings.
-        let mode_changed = t.mode != t.applied_mode;
+        let mode_changed = !self.mode_settled(&sid);
         if mode_changed && let Some(mode) = config::mode(&t.mode) {
             params["approvalPolicy"] = json!(mode.approval);
-            params["sandboxPolicy"] = config::sandbox_policy(mode);
+            self.mode_sandbox(mode, "sandboxPolicy", &mut params);
         }
         if !t.model.is_empty() {
             params["model"] = json!(t.model);
@@ -434,6 +436,25 @@ impl State {
     /// Interrupts the session's turn and its subagents' turns.
     pub(super) fn cancel(&mut self, sid: &str, out: &mut Vec<Out>) {
         self.end_command_prompts(sid, "cancelled", out);
+        // A recovery read must never deliver the message after cancellation.
+        for pending in self.pending.values_mut() {
+            if let Pending::GoalSend { client, thread, .. } | Pending::GoalSendCheck { client, thread, .. } = pending
+                && thread == sid
+            {
+                out.push(Out::Client(ok(client, json!({"stopReason": "cancelled"}))));
+                *pending = Pending::Ignore;
+            }
+        }
+        // Work still waiting for the mode never starts.
+        if let Some(t) = self.threads.get_mut(sid)
+            && !t.after_mode.is_empty()
+        {
+            t.after_mode.clear();
+            (t.starting, t.command_turn, t.compacting) = (false, false, false);
+            if let Some(prompt) = t.prompt.take() {
+                out.push(Out::Client(ok(&prompt, json!({"stopReason": "cancelled"}))));
+            }
+        }
         // A plan review still open: withdraw it, and the prompt ends cancelled.
         if let Some(t) = self.threads.get_mut(sid)
             && let Some((ask, _)) = t.plan_review.take()
