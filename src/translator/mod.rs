@@ -749,3 +749,6 @@ mod tests {
         assert!(model[1].get("_meta").is_none());
     }
 }
+
+#[cfg(test)]
+mod sandbox_tests;
