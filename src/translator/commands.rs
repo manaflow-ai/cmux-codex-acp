@@ -369,6 +369,7 @@ impl State {
                     }
                     return;
                 }
+                self.apply_mode(sid, out);
                 let params =
                     json!({"threadId": sid, "input": [{"type": "text", "text": IMPLEMENT_PLAN, "text_elements": []}]});
                 out.push(self.send(Pending::TurnStart { client, thread: sid.to_owned() }, "turn/start", params));
@@ -416,6 +417,7 @@ impl State {
                     _ => json!({"type": "commit", "sha": rest, "title": null}),
                 };
                 self.begin_command_turn(id, sid);
+                self.apply_mode(sid, out);
                 let params = json!({"threadId": sid, "target": target, "delivery": "inline"});
                 let pending = Pending::TurnStart { client: id.clone(), thread: sid.to_owned() };
                 out.push(self.send(pending, "review/start", params));
@@ -456,6 +458,7 @@ impl State {
                         json!({"threadId": sid, "objective": rest, "status": "active"})
                     };
                     self.begin_command_turn(id, sid);
+                    self.apply_mode(sid, out);
                     wait(self, CommandWait::GoalActive, "thread/goal/set", params, out);
                 }
             },
@@ -924,7 +927,11 @@ impl State {
         let Some(text) = text.filter(|t| !t.trim().is_empty()) else { return };
         t.title_generated = true;
         let cwd = t.cwd.clone();
-        let mut params = json!({"ephemeral": true});
+        // It only writes a title: read-only, asking nothing, whatever the
+        // session's mode or the user's defaults.
+        let mut params = json!({"ephemeral": true, "approvalPolicy": "never"});
+        self.mode_sandbox(config::mode("read-only").expect("read-only mode"), "sandbox", &mut params);
+        self.thread_config(None, &mut params);
         if !cwd.is_empty() {
             params["cwd"] = json!(cwd);
         }

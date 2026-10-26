@@ -114,7 +114,7 @@ impl State {
                 let (Some(sid), Some(mode)) = (s(&p, "sessionId"), s(&p, "modeId")) else {
                     return out.push(Out::Client(err(&id, INVALID_PARAMS, "sessionId and modeId are required")));
                 };
-                match self.set_mode(sid, mode) {
+                match self.set_mode(sid, mode, out) {
                     Ok(()) => {
                         out.push(Out::Client(ok(&id, json!({}))));
                         out.push(update(sid, json!({"sessionUpdate": "current_mode_update", "currentModeId": mode})));
@@ -166,7 +166,7 @@ impl State {
                     return;
                 }
                 let result = if config_id == "mode" {
-                    self.set_mode(sid, &value)
+                    self.set_mode(sid, &value, out)
                 } else {
                     self.set_option(sid, config_id, &value)
                 };
@@ -195,12 +195,15 @@ impl State {
         }
     }
 
-    fn set_mode(&mut self, sid: &str, mode: &str) -> Result<(), String> {
+    /// A mode pick. Codex gets it at once (`apply_mode`): a review, a goal's
+    /// turns or a plan's implementation started next runs in it too.
+    fn set_mode(&mut self, sid: &str, mode: &str, out: &mut Vec<Out>) -> Result<(), String> {
         if config::mode(mode).is_none() {
             return Err(format!("unknown mode {mode:?}"));
         }
         let t = self.threads.get_mut(sid).ok_or_else(|| format!("unknown session {sid}"))?;
         t.mode = mode.to_owned();
+        self.apply_mode(sid, out);
         Ok(())
     }
 
@@ -235,24 +238,12 @@ impl State {
 
     fn thread_params(&self, p: &Value, mode: &str) -> Value {
         let m = config::mode(mode).unwrap_or(&config::MODES[2]);
-        let profile = self.read_only_profile();
         let mut params = json!({"approvalPolicy": m.approval});
-        if profile && m.id == "read-only" {
-            params["permissions"] = json!(config::READ_ONLY_PROFILE);
-        } else {
-            params["sandbox"] = json!(m.sandbox);
-        }
+        self.mode_sandbox(m, "sandbox", &mut params);
         if let Some(cwd) = p.get("cwd").filter(|c| c.is_string()) {
             params["cwd"] = cwd.clone();
         }
-        let mut cfg = config::mcp_config(p.get("mcpServers")).unwrap_or_else(|| json!({}));
-        if profile {
-            let (key, value) = config::read_only_profile();
-            cfg[key] = value;
-        }
-        if cfg.as_object().is_some_and(|c| !c.is_empty()) {
-            params["config"] = cfg;
-        }
+        self.thread_config(config::mcp_config(p.get("mcpServers")), &mut params);
         params
     }
 
@@ -369,15 +360,10 @@ impl State {
         // Approval and sandbox only when the mode changed: the app-server
         // keeps them per thread, and a sandbox policy sent every turn would
         // drop the user's own sandbox settings.
-        let mode_changed = t.mode != t.applied_mode;
+        let mode_changed = !self.mode_settled(&sid);
         if mode_changed && let Some(mode) = config::mode(&t.mode) {
             params["approvalPolicy"] = json!(mode.approval);
-            // `read-only` is a permission profile (see `config::READ_ONLY_PROFILE`).
-            if mode.id == "read-only" && self.read_only_profile() {
-                params["permissions"] = json!(config::READ_ONLY_PROFILE);
-            } else {
-                params["sandboxPolicy"] = config::sandbox_policy(mode);
-            }
+            self.mode_sandbox(mode, "sandboxPolicy", &mut params);
         }
         if !t.model.is_empty() {
             params["model"] = json!(t.model);

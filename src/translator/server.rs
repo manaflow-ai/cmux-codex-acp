@@ -74,6 +74,12 @@ impl State {
                 }
             }
             Pending::ModelList | Pending::Ignore => {}
+            Pending::ModeApply { thread } => {
+                // The next turn sends the mode with it.
+                if let Some(t) = self.threads.get_mut(&thread) {
+                    t.applied_mode.clear();
+                }
+            }
             Pending::TurnStart { client, thread } => {
                 if let Some(t) = self.threads.get_mut(&thread) {
                     t.prompt = None;
@@ -117,6 +123,7 @@ impl State {
                 out.push(self.send(Pending::ModelList, "model/list", json!({})));
                 self.drain_queued(out);
             }
+            Pending::ModeApply { .. } => {}
             Pending::ModelList => {
                 self.models = config::parse_models(r);
                 let default = self.models.iter().find(|m| m.is_default).map(|m| m.id.clone());
@@ -148,6 +155,14 @@ impl State {
                 let Some(sid) = self.adopt_thread(r, mode, effort) else {
                     return out.push(Out::Client(err(&client, INTERNAL, "thread/resume returned no thread")));
                 };
+                // Codex ignores a resume's overrides for a thread it still has
+                // loaded: unless it answers with the mode's settings, send them.
+                if !self.resumed_in_mode(&sid, r)
+                    && let Some(t) = self.threads.get_mut(&sid)
+                {
+                    t.applied_mode.clear();
+                    self.apply_mode(&sid, out);
+                }
                 self.title_choice(&sid, titles);
                 if replay {
                     self.replay(&sid, r.pointer("/thread/turns"), out);

@@ -108,6 +108,11 @@ enum Pending {
         thread: String,
         wait: commands::CommandWait,
     },
+    /// `thread/settings/update` of a session's mode: on an error the mode
+    /// counts as not applied, so the next turn sends it again.
+    ModeApply {
+        thread: String,
+    },
     /// Fire and forget (`turn/interrupt`, `thread/unsubscribe` on close).
     Ignore,
 }
@@ -230,6 +235,8 @@ struct State {
     account: Option<Value>,
     /// Ephemeral title threads: thread id -> (session, agent text so far).
     title_threads: HashMap<String, (String, String)>,
+    /// The id of the permission profile `read-only` selects (`config::read_only_profile_id`).
+    read_only_profile: String,
 }
 
 /// The first Codex app-server whose `turn/start` takes `{"type": "audio"}` input.
@@ -249,6 +256,69 @@ impl State {
     /// app-server: yes unless its version is known to predate it.
     pub(super) fn read_only_profile(&self) -> bool {
         self.user_agent.as_deref().and_then(agent_version).is_none_or(|v| v >= config::READ_ONLY_PROFILE_VERSION)
+    }
+
+    /// The sandbox fields of `mode` for a request: `permissions` (the
+    /// read-only profile) or `key` (`sandbox` for a thread request, the
+    /// `sandboxPolicy` form for a turn or settings update).
+    pub(super) fn mode_sandbox(&self, mode: &config::Mode, key: &str, params: &mut Value) {
+        if mode.id == "read-only" && self.read_only_profile() {
+            params["permissions"] = json!(self.read_only_profile);
+        } else if key == "sandbox" {
+            params["sandbox"] = json!(mode.sandbox);
+        } else {
+            params[key] = config::sandbox_policy(mode);
+        }
+    }
+
+    /// A thread's `config`: `base` (the MCP servers) and the read-only profile.
+    pub(super) fn thread_config(&self, base: Option<Value>, params: &mut Value) {
+        let mut cfg = base.unwrap_or_else(|| json!({}));
+        if self.read_only_profile() {
+            let (key, value) = config::read_only_profile(&self.read_only_profile);
+            cfg[key] = value;
+        }
+        if cfg.as_object().is_some_and(|c| !c.is_empty()) {
+            params["config"] = cfg;
+        }
+    }
+
+    /// Whether a `thread/resume` result shows the session's mode in force: its
+    /// approval policy, and the read-only profile or the mode's sandbox type.
+    pub(super) fn resumed_in_mode(&self, sid: &str, r: &Value) -> bool {
+        let Some(mode) = self.threads.get(sid).and_then(|t| config::mode(&t.mode)) else { return false };
+        if r.get("approvalPolicy").and_then(Value::as_str) != Some(mode.approval) {
+            return false;
+        }
+        let profile = r.pointer("/activePermissionProfile/id").and_then(Value::as_str);
+        if mode.id == "read-only" && self.read_only_profile() {
+            return profile == Some(self.read_only_profile.as_str());
+        }
+        profile != Some(self.read_only_profile.as_str())
+            && r.pointer("/sandbox/type") == config::sandbox_policy(mode).get("type")
+    }
+
+    /// Whether Codex has the session's mode: it took it, and no update of it
+    /// is still on its way (one that fails would leave the old mode).
+    pub(super) fn mode_settled(&self, sid: &str) -> bool {
+        self.threads.get(sid).is_some_and(|t| t.mode == t.applied_mode)
+            && !self.pending.values().any(|p| matches!(p, Pending::ModeApply { thread } if thread == sid))
+    }
+
+    /// Sends the session's mode to Codex now when Codex does not have it
+    /// yet, so whatever runs next (a turn, a review, a goal's turns) runs in it.
+    pub(super) fn apply_mode(&mut self, sid: &str, out: &mut Vec<Out>) {
+        if self.mode_settled(sid) {
+            return;
+        }
+        let Some(t) = self.threads.get(sid) else { return };
+        let Some(mode) = config::mode(&t.mode) else { return };
+        let mut params = json!({"threadId": sid, "approvalPolicy": mode.approval});
+        self.mode_sandbox(mode, "sandboxPolicy", &mut params);
+        if let Some(t) = self.threads.get_mut(sid) {
+            t.applied_mode = t.mode.clone();
+        }
+        out.push(self.send(Pending::ModeApply { thread: sid.to_owned() }, "thread/settings/update", params));
     }
 
     /// Whether this app-server takes audio input: the caller opted in and the
@@ -313,6 +383,7 @@ impl Translator {
                 user_agent: None,
                 account: None,
                 title_threads: HashMap::new(),
+                read_only_profile: config::read_only_profile_id(),
             }),
         }
     }

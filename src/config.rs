@@ -58,6 +58,8 @@ pub fn mode(id: &str) -> Option<&'static Mode> {
 
 /// The permission profile `read-only` selects on an app-server that has it
 /// ([`READ_ONLY_PROFILE_VERSION`]): Codex's `:read-only` plus one deny entry.
+/// Its id is [`READ_ONLY_PROFILE`] plus a random suffix per translator, so no
+/// profile of the user's or a project's config can merge grants into it.
 ///
 /// A command that a Codex rule (`~/.codex/rules`) explicitly allows skips the
 /// approval prompt, and with the plain `read-only` sandbox mode it also runs
@@ -79,13 +81,18 @@ const READ_ONLY_PROFILE_DENY: &str = "/nonexistent-cmux-codex-acp/*";
 /// sandbox mode.
 pub const READ_ONLY_PROFILE_VERSION: (u64, u64, u64) = (0, 136, 0);
 
-/// The `config` entry that defines [`READ_ONLY_PROFILE`]. Every thread gets
-/// it, so a later turn can switch into `read-only`.
-pub fn read_only_profile() -> (String, Value) {
-    (
-        format!("permissions.{READ_ONLY_PROFILE}"),
-        json!({"extends": ":read-only", "filesystem": {READ_ONLY_PROFILE_DENY: "deny"}}),
-    )
+/// A fresh id for the read-only profile.
+pub fn read_only_profile_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    // `RandomState` is seeded from the OS's randomness.
+    let random = std::collections::hash_map::RandomState::new().build_hasher().finish();
+    format!("{READ_ONLY_PROFILE}-{random:016x}")
+}
+
+/// The `config` entry that defines the read-only profile `id`. Every thread
+/// gets it, so a later turn can switch into `read-only`.
+pub fn read_only_profile(id: &str) -> (String, Value) {
+    (format!("permissions.{id}"), json!({"extends": ":read-only", "filesystem": {READ_ONLY_PROFILE_DENY: "deny"}}))
 }
 
 /// `SandboxPolicy` for `turn/start` (the per-turn override takes the policy
