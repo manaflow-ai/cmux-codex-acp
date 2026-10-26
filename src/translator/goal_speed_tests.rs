@@ -80,7 +80,11 @@ fn a_goal_continuation_winning_the_send_race_preserves_the_input() {
 
 #[test]
 fn an_unrelated_start_error_is_never_replayed() {
-    for (code, message) in [(-32600, "model is unavailable"), (-32603, "thread already has an active turn")] {
+    for (code, message) in [
+        (-32600, "model is unavailable"),
+        (-32603, "thread already has an active turn"),
+        (-32600, "thread is not already in a turn"),
+    ] {
         let translator = setup();
         active_goal(&translator);
         let start = request(send(&translator), "turn/start");

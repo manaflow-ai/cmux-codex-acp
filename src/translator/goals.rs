@@ -71,10 +71,5 @@ impl State {
 }
 
 pub(super) fn busy_refusal(code: i64, message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    code == -32600
-        && message.contains("already")
-        && (message.contains("active turn")
-            || message.contains("turn is already running")
-            || message.contains("already in a turn"))
+    code == -32600 && message == "thread already has an active turn"
 }
