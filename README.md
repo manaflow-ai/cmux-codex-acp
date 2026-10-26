@@ -55,8 +55,11 @@ mode is the plain read-only sandbox, where a rules-allowed command runs outside
 it. Codex keeps the deny entry for the rest of the session: after `read-only`,
 `ask` and `agent` also run rules-allowed commands in their sandbox, and an
 approved escalation there writes anywhere but has no network;
-`agent-full-access` drops it. The thread that writes a session's title runs in
-the same profile and asks nothing.
+`agent-full-access` drops it. A read-only thread Codex starts, resumes or
+forks in another profile (managed requirements can do that without an error)
+is moved into this one, and fails to run if Codex refuses. The thread that
+writes a session's title runs in the same profile and asks nothing; if Codex
+starts it elsewhere, no title is written.
 
 Config options: `model` (from `model/list`), `reasoning_effort` (the model's
 supported efforts), `mode`. A mode change goes to Codex at once

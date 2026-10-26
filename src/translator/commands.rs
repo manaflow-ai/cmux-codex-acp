@@ -610,6 +610,11 @@ impl State {
             }
             CommandWait::TitleThread(text) => {
                 let Some(title_thread) = r.pointer("/thread/id").and_then(Value::as_str) else { return };
+                // Codex did not start it read-only: no title, rather than a
+                // turn that could run a command outside the sandbox.
+                if !self.result_read_only(r) {
+                    return;
+                }
                 self.title_threads.insert(title_thread.to_owned(), (sid, String::new()));
                 let input = format!("{TITLE_PROMPT}\n\nUser's first message:\n{text}");
                 let params = json!({"threadId": title_thread, "input": [{"type": "text", "text": input, "text_elements": []}],

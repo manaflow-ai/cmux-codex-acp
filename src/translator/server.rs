@@ -159,6 +159,7 @@ impl State {
             }
             Pending::ThreadStart { client, mode, effort, titles } => match self.adopt_thread(r, mode, Some(effort)) {
                 Some(sid) => {
+                    self.settle_read_only(&sid, r, out);
                     self.title_choice(&sid, titles);
                     let extra = json!({"_meta": {"codexAppServer": {"threadPath": r.pointer("/thread/path"), "cliVersion": r.pointer("/thread/cliVersion"), "model": r.get("model")}}});
                     out.push(Out::Client(ok(&client, self.session_result(&sid, extra))));
@@ -182,11 +183,8 @@ impl State {
                     && let Some(t) = self.threads.get_mut(&sid)
                 {
                     (t.mode, t.applied_mode) = (mode, applied);
-                } else if !self.resumed_read_only(&sid, r)
-                    && let Some(t) = self.threads.get_mut(&sid)
-                {
-                    t.applied_mode.clear();
-                    self.apply_mode(&sid, out);
+                } else {
+                    self.settle_read_only(&sid, r, out);
                 }
                 self.title_choice(&sid, titles);
                 if replay {
@@ -221,6 +219,7 @@ impl State {
             }
             Pending::ThreadFork { client, mode, titles } => match self.adopt_thread(r, mode, None) {
                 Some(sid) => {
+                    self.settle_read_only(&sid, r, out);
                     self.title_choice(&sid, titles);
                     out.push(Out::Client(ok(&client, self.session_result(&sid, json!({})))));
                     self.publish_commands(&sid, out);

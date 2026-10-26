@@ -291,20 +291,31 @@ impl State {
         }
     }
 
-    /// Whether a read-only session's `thread/resume` result shows Codex
-    /// running it read-only: in the profile (or, on an older app-server, the
-    /// read-only sandbox). Codex ignores a resume's overrides for a thread it
-    /// still has loaded. Only read-only is checked: a resume never moves a
-    /// thread to a wider mode than Codex has it in.
-    pub(super) fn resumed_read_only(&self, sid: &str, r: &Value) -> bool {
-        if self.threads.get(sid).is_none_or(|t| t.mode != "read-only") {
-            return true;
-        }
+    /// Whether a `thread/start`, `thread/resume` or `thread/fork` result shows
+    /// Codex running the thread read-only: in the profile (or, on an older
+    /// app-server, the read-only sandbox).
+    pub(super) fn result_read_only(&self, r: &Value) -> bool {
         if self.read_only_profile() {
             r.pointer("/activePermissionProfile/id").and_then(Value::as_str) == Some(self.read_only_profile.as_str())
         } else {
             r.pointer("/sandbox/type").and_then(Value::as_str) == Some("readOnly")
         }
+    }
+
+    /// After a thread's start, resume or fork: a read-only session that Codex
+    /// does not run read-only is moved into it. Codex ignores a resume's
+    /// overrides for a thread it still has loaded, and managed requirements
+    /// can make it start a thread in another profile with no error. Only
+    /// read-only is checked: this never moves a thread to a wider mode than
+    /// Codex has it in.
+    pub(super) fn settle_read_only(&mut self, sid: &str, r: &Value, out: &mut Vec<Out>) {
+        if self.threads.get(sid).is_none_or(|t| t.mode != "read-only") || self.result_read_only(r) {
+            return;
+        }
+        if let Some(t) = self.threads.get_mut(sid) {
+            t.applied_mode.clear();
+        }
+        self.apply_mode(sid, out);
     }
 
     /// Sends `method` once Codex has the session's mode: now when it has it,
