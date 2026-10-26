@@ -235,11 +235,22 @@ impl State {
 
     fn thread_params(&self, p: &Value, mode: &str) -> Value {
         let m = config::mode(mode).unwrap_or(&config::MODES[2]);
-        let mut params = json!({"approvalPolicy": m.approval, "sandbox": m.sandbox});
+        let profile = self.read_only_profile();
+        let mut params = json!({"approvalPolicy": m.approval});
+        if profile && m.id == "read-only" {
+            params["permissions"] = json!(config::READ_ONLY_PROFILE);
+        } else {
+            params["sandbox"] = json!(m.sandbox);
+        }
         if let Some(cwd) = p.get("cwd").filter(|c| c.is_string()) {
             params["cwd"] = cwd.clone();
         }
-        if let Some(cfg) = config::mcp_config(p.get("mcpServers")) {
+        let mut cfg = config::mcp_config(p.get("mcpServers")).unwrap_or_else(|| json!({}));
+        if profile {
+            let (key, value) = config::read_only_profile();
+            cfg[key] = value;
+        }
+        if cfg.as_object().is_some_and(|c| !c.is_empty()) {
             params["config"] = cfg;
         }
         params
@@ -361,7 +372,12 @@ impl State {
         let mode_changed = t.mode != t.applied_mode;
         if mode_changed && let Some(mode) = config::mode(&t.mode) {
             params["approvalPolicy"] = json!(mode.approval);
-            params["sandboxPolicy"] = config::sandbox_policy(mode);
+            // `read-only` is a permission profile (see `config::READ_ONLY_PROFILE`).
+            if mode.id == "read-only" && self.read_only_profile() {
+                params["permissions"] = json!(config::READ_ONLY_PROFILE);
+            } else {
+                params["sandboxPolicy"] = config::sandbox_policy(mode);
+            }
         }
         if !t.model.is_empty() {
             params["model"] = json!(t.model);

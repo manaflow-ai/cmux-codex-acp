@@ -45,6 +45,17 @@ built from the decisions Codex offers for that request.
 | `agent` (default) | on-request | workspace-write |
 | `agent-full-access` | never | danger-full-access |
 
+A command that a Codex rule (`~/.codex/rules`) explicitly allows runs without
+asking in every mode. In `read-only` it still runs inside the read-only
+sandbox: the mode selects a permission profile, `cmux-read-only` (Codex's
+`:read-only` plus a deny entry that hides nothing), and Codex keeps every
+command of a profile with a deny entry in the sandbox. With Codex older than
+0.136.0 the mode is the plain read-only sandbox, where a rules-allowed command
+runs outside it. Codex keeps the deny entry for the rest of the session: after
+`read-only`, `ask` and `agent` also run rules-allowed commands in their
+sandbox, and an approved escalation there writes anywhere but has no network;
+`agent-full-access` drops it.
+
 Config options: `model` (from `model/list`), `reasoning_effort` (the model's
 supported efforts), `mode`. A change applies from the next turn: Codex takes
 model, effort, approval policy and sandbox per turn.

@@ -245,6 +245,12 @@ fn agent_version(user_agent: &str) -> Option<(u64, u64, u64)> {
 }
 
 impl State {
+    /// Whether `read-only` selects [`config::READ_ONLY_PROFILE`] on this
+    /// app-server: yes unless its version is known to predate it.
+    pub(super) fn read_only_profile(&self) -> bool {
+        self.user_agent.as_deref().and_then(agent_version).is_none_or(|v| v >= config::READ_ONLY_PROFILE_VERSION)
+    }
+
     /// Whether this app-server takes audio input: the caller opted in and the
     /// server's version is known to accept it.
     pub(super) fn audio_input(&self) -> bool {
