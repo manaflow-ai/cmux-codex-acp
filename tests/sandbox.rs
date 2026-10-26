@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,10 +29,12 @@ const TURN: Duration = Duration::from_secs(120);
 
 /// The model stand-in: an OpenAI Responses endpoint whose first answer is
 /// one `exec_command` call of `command` and whose later answers end the turn.
-/// It keeps every request body it got.
+/// It keeps every request body it got, and sends the command's output (what
+/// Codex told the model) on `outputs`.
 struct Model {
     url: String,
     bodies: Arc<Mutex<Vec<Value>>>,
+    outputs: Receiver<String>,
 }
 
 fn model(command: String) -> Model {
@@ -39,17 +42,27 @@ fn model(command: String) -> Model {
     let url = format!("http://{}/v1", listener.local_addr().expect("its address"));
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let kept = bodies.clone();
+    let (tx, outputs) = channel();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { break };
-            let (kept, command) = (kept.clone(), command.clone());
-            std::thread::spawn(move || answer(stream, &kept, &command));
+            let (kept, command, tx) = (kept.clone(), command.clone(), tx.clone());
+            std::thread::spawn(move || answer(stream, &kept, &command, &tx));
         }
     });
-    Model { url, bodies }
+    Model { url, bodies, outputs }
 }
 
-fn answer(stream: TcpStream, kept: &Mutex<Vec<Value>>, command: &str) {
+/// The output of the command call in a request body, if it has one.
+fn command_output(body: &Value) -> Option<String> {
+    body["input"]
+        .as_array()?
+        .iter()
+        .find(|i| i["type"] == "function_call_output" && i["call_id"] == "call-1")
+        .map(|i| i["output"].as_str().map_or_else(|| i["output"].to_string(), str::to_owned))
+}
+
+fn answer(stream: TcpStream, kept: &Mutex<Vec<Value>>, command: &str, outputs: &Sender<String>) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone the stream"));
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
@@ -78,9 +91,13 @@ fn answer(stream: TcpStream, kept: &Mutex<Vec<Value>>, command: &str) {
         let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
         return;
     }
+    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    if let Some(output) = command_output(&body) {
+        let _ = outputs.send(output);
+    }
     let first = {
         let mut kept = kept.lock().unwrap();
-        kept.push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+        kept.push(body);
         kept.len() == 1
     };
     let usage = json!({"input_tokens": 0, "input_tokens_details": null, "output_tokens": 0, "output_tokens_details": null, "total_tokens": 0});
@@ -166,48 +183,85 @@ impl Rig {
         (a, s["sessionId"].as_str().expect("sessionId").to_owned())
     }
 
-    /// Runs one turn; asserts the command ran without a permission request,
+    /// Runs one prompt; asserts the command ran without a permission request,
     /// and returns whether its file exists and what the model was told.
-    fn run_turn(&self, a: &mut Agent, sid: &str) -> (bool, String) {
-        let (r, from) = a.prompt(sid, "go", TURN);
+    fn run_turn(&self, a: &mut Agent, sid: &str, text: &str) -> (bool, String) {
+        let (r, from) = a.prompt(sid, text, TURN);
         assert!(r.get("error").is_none(), "prompt failed: {r}");
         let asked = a.log[from..].iter().any(|(_, m)| m["method"] == "session/request_permission");
         assert!(!asked, "a rules-allowed command asked for permission");
         let bodies = self.model.bodies.lock().unwrap();
-        let output = bodies
-            .iter()
-            .flat_map(|b| b["input"].as_array().cloned().unwrap_or_default())
-            .find(|i| i["type"] == "function_call_output" && i["call_id"] == "call-1")
-            .map(|i| i["output"].to_string())
-            .expect("the command ran and its output went back to the model");
+        let output = bodies.iter().find_map(command_output).expect("the command's output went back to the model");
+        (self.target.exists(), output)
+    }
+
+    /// Sends a prompt and waits only until the command's output reached the
+    /// model (a review's own end needs a review result the stand-in does not
+    /// give). Any permission request is refused (`start`), which would show
+    /// in the output as a refusal, not a sandbox denial.
+    fn run_until_output(&self, a: &mut Agent, sid: &str, text: &str) -> (bool, String) {
+        a.request("session/prompt", json!({"sessionId": sid, "prompt": [{"type": "text", "text": text}]}));
+        let output = self.model.outputs.recv_timeout(TURN).expect("the command's output went back to the model");
         (self.target.exists(), output)
     }
 }
 
+/// The command ran, and the sandbox refused its write: Linux's bubblewrap
+/// mounts the filesystem read-only, macOS's Seatbelt denies the write.
 fn assert_sandboxed(written: bool, output: &str, target: &Path) {
     assert!(
         !written,
         "a command a Codex rule allows ran outside the read-only sandbox: it wrote {} (output: {output})",
         target.display()
     );
+    assert!(
+        output.contains("touch")
+            && (output.contains("Read-only file system") || output.contains("Operation not permitted")),
+        "the command did not run into the sandbox: {output}"
+    );
+}
+
+#[test]
+fn a_rules_allowed_command_runs_and_writes_where_its_mode_lets_it() {
+    // The control: the same command in `agent` writes in the workspace.
+    let Some(rig) = rig("control", Some("agent")) else { return };
+    let (mut a, sid) = rig.start();
+    let (written, output) = rig.run_turn(&mut a, &sid, "go");
+    assert!(written, "the command did not write in agent mode (output: {output})");
+    assert!(output.contains("exited with code 0"), "{output}");
+    a.close();
 }
 
 #[test]
 fn a_rules_allowed_command_runs_in_the_read_only_sandbox() {
     let Some(rig) = rig("start", Some("read-only")) else { return };
     let (mut a, sid) = rig.start();
-    let (written, output) = rig.run_turn(&mut a, &sid);
+    let (written, output) = rig.run_turn(&mut a, &sid, "go");
     assert_sandboxed(written, &output, &rig.target);
     a.close();
+}
+
+fn switch_to_read_only(a: &mut Agent, sid: &str) {
+    let id = a.request("session/set_mode", json!({"sessionId": sid, "modeId": "read-only"}));
+    a.result(id, Duration::from_secs(10));
 }
 
 #[test]
 fn a_rules_allowed_command_runs_in_the_read_only_sandbox_after_a_switch() {
     let Some(rig) = rig("switch", None) else { return };
     let (mut a, sid) = rig.start();
-    let id = a.request("session/set_mode", json!({"sessionId": sid, "modeId": "read-only"}));
-    a.result(id, Duration::from_secs(10));
-    let (written, output) = rig.run_turn(&mut a, &sid);
+    switch_to_read_only(&mut a, &sid);
+    let (written, output) = rig.run_turn(&mut a, &sid, "go");
+    assert_sandboxed(written, &output, &rig.target);
+    a.close();
+}
+
+#[test]
+fn a_review_after_a_switch_runs_in_the_read_only_sandbox() {
+    let Some(rig) = rig("review", None) else { return };
+    let (mut a, sid) = rig.start();
+    switch_to_read_only(&mut a, &sid);
+    let (written, output) = rig.run_until_output(&mut a, &sid, "/review");
     assert_sandboxed(written, &output, &rig.target);
     a.close();
 }

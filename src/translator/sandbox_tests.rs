@@ -1,18 +1,22 @@
 //! `read-only` runs in a permission profile with a deny entry, so a command a
-//! Codex rule allows skips the prompt but not the sandbox.
+//! Codex rule allows skips the prompt but not the sandbox. Every path that
+//! starts work in a read-only session runs in that profile.
 
 use super::*;
 
 const CURRENT: &str = "acpmux/0.164.0 (Ubuntu 24.4.0; x86_64) unknown (acpmux; 1)";
-const PROFILE: &str = "cmux-read-only";
 
-fn server_request(outs: Vec<Out>, method: &str) -> Value {
-    outs.into_iter()
-        .find_map(|o| match o {
-            Out::Server(m) if m["method"] == method => Some(m),
+fn server_requests(outs: &[Out], method: &str) -> Vec<Value> {
+    outs.iter()
+        .filter_map(|o| match o {
+            Out::Server(m) if m["method"] == method => Some(m.clone()),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("no {method} sent"))
+        .collect()
+}
+
+fn server_request(outs: Vec<Out>, method: &str) -> Value {
+    server_requests(&outs, method).pop().unwrap_or_else(|| panic!("no {method} sent: {outs:?}"))
 }
 
 /// A translator past `initialize` and `model/list` from an app-server whose
@@ -29,6 +33,15 @@ fn translator(user_agent: &str, mode: &str) -> Translator {
     translator
 }
 
+/// The id of the read-only profile a thread request defines (its
+/// `permissions.<id>` config entry).
+fn profile_of(params: &Value) -> String {
+    let config = params["config"].as_object().unwrap_or_else(|| panic!("no config: {params}"));
+    let ids: Vec<&str> = config.keys().filter_map(|k| k.strip_prefix("permissions.")).collect();
+    assert_eq!(ids.len(), 1, "one profile: {params}");
+    ids[0].to_owned()
+}
+
 /// The `thread/start` of a `session/new`, and the session once Codex answers.
 fn new_session(translator: &Translator, mcp: Value) -> Value {
     let start = server_request(
@@ -41,39 +54,65 @@ fn new_session(translator: &Translator, mcp: Value) -> Value {
     start["params"].clone()
 }
 
-fn set_mode(translator: &Translator, mode: &str) {
+/// What a `session/set_mode` sent the app-server.
+fn set_mode(translator: &Translator, mode: &str) -> Vec<Out> {
     translator.from_client(&json!({"jsonrpc": "2.0", "id": 2, "method": "session/set_mode",
-        "params": {"sessionId": "t", "modeId": mode}}));
+        "params": {"sessionId": "t", "modeId": mode}}))
 }
 
-/// The `turn/start` params of a prompt; the turn is then over.
-fn turn(translator: &Translator) -> Value {
-    let start = server_request(
-        translator.from_client(&json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
-            "params": {"sessionId": "t", "prompt": [{"type": "text", "text": "go"}]}})),
-        "turn/start",
-    );
+/// What a prompt of `text` sent the app-server; the turn is then over.
+fn prompt(translator: &Translator, text: &str) -> Vec<Out> {
+    let outs = translator.from_client(&json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+        "params": {"sessionId": "t", "prompt": [{"type": "text", "text": text}]}}));
     let mut state = translator.state.lock().unwrap();
     let t = state.threads.get_mut("t").expect("thread t");
-    (t.starting, t.prompt) = (false, None);
-    start["params"].clone()
+    (t.starting, t.prompt, t.command_turn) = (false, None, false);
+    outs
 }
 
-fn assert_defines_profile(params: &Value) {
-    let profile = &params["config"][format!("permissions.{PROFILE}")];
+fn turn(translator: &Translator) -> Value {
+    server_request(prompt(translator, "go"), "turn/start")["params"].clone()
+}
+
+fn assert_defines_profile(params: &Value, id: &str) {
+    let profile = &params["config"][format!("permissions.{id}")];
     assert_eq!(profile["extends"], ":read-only", "profile: {params}");
     let filesystem = profile["filesystem"].as_object().expect("the profile's filesystem entries");
     assert!(filesystem.values().any(|access| access == "deny"), "no deny entry: {params}");
+}
+
+/// The `thread/settings/update` a mode change sent, which must select the
+/// read-only profile with the mode's approval policy.
+fn assert_selects_profile(outs: &[Out], id: &str) -> Value {
+    let update = server_requests(outs, "thread/settings/update").pop().expect("a thread/settings/update");
+    let params = &update["params"];
+    assert_eq!(params["threadId"], "t");
+    assert_eq!(params["permissions"], id, "{params}");
+    assert_eq!(params["approvalPolicy"], "on-request");
+    assert!(params.get("sandboxPolicy").is_none(), "`permissions` cannot go with `sandboxPolicy`: {params}");
+    update
 }
 
 #[test]
 fn a_read_only_session_starts_in_the_profile() {
     let translator = translator(CURRENT, "read-only");
     let params = new_session(&translator, json!([]));
-    assert_eq!(params["permissions"], PROFILE, "thread/start: {params}");
+    let id = profile_of(&params);
+    assert!(id.starts_with(config::READ_ONLY_PROFILE), "{id}");
+    assert_eq!(params["permissions"], id, "thread/start: {params}");
     assert!(params.get("sandbox").is_none(), "`permissions` cannot go with `sandbox`: {params}");
     assert_eq!(params["approvalPolicy"], "on-request");
-    assert_defines_profile(&params);
+    assert_defines_profile(&params, &id);
+}
+
+#[test]
+fn no_config_can_add_to_the_profile() {
+    // Codex merges config tables: a `[permissions.<id>]` of the user's or a
+    // project's would add its grants to a profile of the same id.
+    let (a, b) = (translator(CURRENT, "read-only"), translator(CURRENT, "read-only"));
+    let (a, b) = (profile_of(&new_session(&a, json!([]))), profile_of(&new_session(&b, json!([]))));
+    assert_ne!(a, b);
+    assert_ne!(a, config::READ_ONLY_PROFILE);
 }
 
 #[test]
@@ -82,32 +121,69 @@ fn every_session_defines_the_profile_beside_its_mcp_servers() {
     let params = new_session(&translator, json!([{"name": "gh", "command": "/bin/gh", "args": ["mcp"], "env": []}]));
     assert_eq!(params["sandbox"], "workspace-write");
     assert!(params.get("permissions").is_none());
-    assert_defines_profile(&params);
+    assert_defines_profile(&params, &profile_of(&params));
     assert_eq!(params["config"]["mcp_servers.gh"]["command"], "/bin/gh");
 }
 
 #[test]
-fn switching_to_read_only_selects_the_profile_and_back_selects_the_sandbox() {
+fn switching_to_read_only_selects_the_profile_at_once_and_back_selects_the_sandbox() {
     let translator = translator(CURRENT, "agent");
-    new_session(&translator, json!([]));
-    set_mode(&translator, "read-only");
-    let params = turn(&translator);
-    assert_eq!(params["permissions"], PROFILE, "turn/start: {params}");
-    assert_eq!(params["approvalPolicy"], "on-request");
-    assert!(params.get("sandboxPolicy").is_none(), "`permissions` cannot go with `sandboxPolicy`: {params}");
-    // No mode change: no override either.
+    let id = profile_of(&new_session(&translator, json!([])));
+    let update = assert_selects_profile(&set_mode(&translator, "read-only"), &id);
+    // Until Codex took it, a turn carries it too.
+    assert_eq!(turn(&translator)["permissions"], id);
+    translator.from_server(&json!({"jsonrpc": "2.0", "id": update["id"], "result": {}}));
+    // Codex has it: the turn sends no override.
     let params = turn(&translator);
     assert!(params.get("permissions").is_none() && params.get("sandboxPolicy").is_none(), "{params}");
-    set_mode(&translator, "agent");
-    let params = turn(&translator);
+    // The same mode again sends nothing.
+    assert!(server_requests(&set_mode(&translator, "read-only"), "thread/settings/update").is_empty());
+    let outs = set_mode(&translator, "agent");
+    let params = &server_requests(&outs, "thread/settings/update")[0]["params"];
     assert!(params.get("permissions").is_none(), "{params}");
     assert_eq!(params["sandboxPolicy"]["type"], "workspaceWrite");
 }
 
 #[test]
+fn a_switch_codex_refused_goes_with_the_next_turn() {
+    let translator = translator(CURRENT, "agent");
+    let id = profile_of(&new_session(&translator, json!([])));
+    let update = assert_selects_profile(&set_mode(&translator, "read-only"), &id);
+    translator.from_server(&json!({"jsonrpc": "2.0", "id": update["id"], "error": {"code": -32600, "message": "no"}}));
+    let params = turn(&translator);
+    assert_eq!(params["permissions"], id, "turn/start: {params}");
+    assert_eq!(params["approvalPolicy"], "on-request");
+    assert!(params.get("sandboxPolicy").is_none(), "{params}");
+}
+
+#[test]
+fn a_review_or_goal_after_a_refused_switch_runs_in_the_profile() {
+    for command in ["/review", "/goal tidy up"] {
+        let translator = translator(CURRENT, "agent");
+        let id = profile_of(&new_session(&translator, json!([])));
+        let update = assert_selects_profile(&set_mode(&translator, "read-only"), &id);
+        translator
+            .from_server(&json!({"jsonrpc": "2.0", "id": update["id"], "error": {"code": -32600, "message": "no"}}));
+        let outs = prompt(&translator, command);
+        let work = outs
+            .iter()
+            .position(
+                |o| matches!(o, Out::Server(m) if m["method"] == "review/start" || m["method"] == "thread/goal/set"),
+            )
+            .unwrap_or_else(|| panic!("{command} started nothing: {outs:?}"));
+        let settings = outs
+            .iter()
+            .position(|o| matches!(o, Out::Server(m) if m["method"] == "thread/settings/update"))
+            .unwrap_or_else(|| panic!("{command} did not apply the mode: {outs:?}"));
+        assert!(settings < work, "{command}: the mode must reach Codex before the work starts");
+        assert_selects_profile(&outs, &id);
+    }
+}
+
+#[test]
 fn a_resumed_or_forked_read_only_session_stays_in_the_profile() {
     let translator = translator(CURRENT, "read-only");
-    new_session(&translator, json!([]));
+    let id = profile_of(&new_session(&translator, json!([])));
     for method in ["session/resume", "session/load", "session/fork"] {
         let params = server_request(
             translator.from_client(&json!({"jsonrpc": "2.0", "id": 4, "method": method,
@@ -115,10 +191,46 @@ fn a_resumed_or_forked_read_only_session_stays_in_the_profile() {
             if method == "session/fork" { "thread/fork" } else { "thread/resume" },
         )["params"]
             .clone();
-        assert_eq!(params["permissions"], PROFILE, "{method}: {params}");
+        assert_eq!(params["permissions"], id, "{method}: {params}");
         assert!(params.get("sandbox").is_none(), "{method}: {params}");
-        assert_defines_profile(&params);
+        assert_defines_profile(&params, &id);
     }
+}
+
+#[test]
+fn a_resume_codex_did_not_apply_is_applied_after_it() {
+    let translator = translator(CURRENT, "read-only");
+    let id = profile_of(&new_session(&translator, json!([])));
+    let resume = |result: Value| {
+        let request = server_request(
+            translator.from_client(&json!({"jsonrpc": "2.0", "id": 4, "method": "session/resume",
+                "params": {"sessionId": "t", "cwd": "/w", "mcpServers": []}})),
+            "thread/resume",
+        );
+        let mut r = json!({"thread": {"id": "t", "cwd": "/w"}});
+        r.as_object_mut().unwrap().extend(result.as_object().unwrap().clone());
+        translator.from_server(&json!({"jsonrpc": "2.0", "id": request["id"], "result": r}))
+    };
+    // Still loaded in Codex in another mode: it kept that one.
+    let outs = resume(json!({"approvalPolicy": "on-request", "sandbox": {"type": "workspaceWrite"}}));
+    assert_selects_profile(&outs, &id);
+    // Resumed in the profile: nothing more to send.
+    let outs = resume(json!({"approvalPolicy": "on-request", "sandbox": {"type": "readOnly"},
+        "activePermissionProfile": {"id": id, "extends": ":read-only"}}));
+    assert!(server_requests(&outs, "thread/settings/update").is_empty(), "{outs:?}");
+}
+
+#[test]
+fn the_title_thread_runs_read_only_and_asks_nothing() {
+    let translator = translator(CURRENT, "agent-full-access");
+    let id = profile_of(&new_session(&translator, json!([])));
+    let mut outs = Vec::new();
+    translator.state.lock().unwrap().generate_title("t", Some("fix the build".into()), &mut outs);
+    let params = server_request(outs, "thread/start")["params"].clone();
+    assert_eq!(params["ephemeral"], true);
+    assert_eq!(params["approvalPolicy"], "never", "{params}");
+    assert_eq!(params["permissions"], id, "{params}");
+    assert_defines_profile(&params, &id);
 }
 
 #[test]
@@ -130,9 +242,8 @@ fn an_app_server_without_the_profile_check_keeps_the_sandbox_mode() {
     assert_eq!(params["sandbox"], "read-only", "{params}");
     assert!(params.get("permissions").is_none() && params.get("config").is_none(), "{params}");
     set_mode(&translator, "agent");
-    turn(&translator);
-    set_mode(&translator, "read-only");
-    let params = turn(&translator);
+    let outs = set_mode(&translator, "read-only");
+    let params = &server_requests(&outs, "thread/settings/update")[0]["params"];
     assert_eq!(params["sandboxPolicy"]["type"], "readOnly", "{params}");
     assert!(params.get("permissions").is_none());
 }
