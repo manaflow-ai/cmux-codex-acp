@@ -42,16 +42,24 @@ fn profile_of(params: &Value) -> String {
     ids[0].to_owned()
 }
 
-/// The `thread/start` of a `session/new`, and the session once Codex answers.
+/// The `thread/start` of a `session/new`, and the session once Codex answers
+/// it, in the profile or sandbox it asked for.
 fn new_session(translator: &Translator, mcp: Value) -> Value {
     let start = server_request(
         translator.from_client(&json!({"jsonrpc": "2.0", "id": 1, "method": "session/new",
             "params": {"cwd": "/w", "mcpServers": mcp}})),
         "thread/start",
     );
-    translator
-        .from_server(&json!({"jsonrpc": "2.0", "id": start["id"], "result": {"thread": {"id": "t", "cwd": "/w"}}}));
-    start["params"].clone()
+    let params = &start["params"];
+    let mut r = json!({"thread": {"id": "t", "cwd": "/w"}});
+    if let Some(id) = params.get("permissions") {
+        r["activePermissionProfile"] = json!({"id": id, "extends": ":read-only"});
+        r["sandbox"] = json!({"type": "readOnly"});
+    } else if params["sandbox"] == "read-only" {
+        r["sandbox"] = json!({"type": "readOnly"});
+    }
+    translator.from_server(&json!({"jsonrpc": "2.0", "id": start["id"], "result": r}));
+    params.clone()
 }
 
 /// What a `session/set_mode` sent the app-server.
@@ -362,6 +370,56 @@ fn a_resume_never_widens_what_codex_runs() {
     let outs = translator.from_server(&json!({"jsonrpc": "2.0", "id": request["id"], "result": {
         "thread": {"id": "t", "cwd": "/w"}, "approvalPolicy": "untrusted", "sandbox": {"type": "readOnly"}}}));
     assert!(server_requests(&outs, "thread/settings/update").is_empty(), "{outs:?}");
+}
+
+#[test]
+fn a_start_or_fork_codex_did_not_put_in_the_profile_is_moved_into_it() {
+    // Managed requirements can make Codex start a thread in another profile
+    // than the one asked for, with no error.
+    let translator = translator(CURRENT, "read-only");
+    let start = server_request(
+        translator.from_client(&json!({"jsonrpc": "2.0", "id": 1, "method": "session/new",
+            "params": {"cwd": "/w", "mcpServers": []}})),
+        "thread/start",
+    );
+    let id = profile_of(&start["params"]);
+    let elsewhere = json!({"approvalPolicy": "on-request", "sandbox": {"type": "readOnly"},
+        "activePermissionProfile": {"id": ":read-only"}});
+    let mut r = json!({"thread": {"id": "t", "cwd": "/w"}});
+    r.as_object_mut().unwrap().extend(elsewhere.as_object().unwrap().clone());
+    let outs = translator.from_server(&json!({"jsonrpc": "2.0", "id": start["id"], "result": r}));
+    let update = assert_selects_profile(&outs, &id);
+    answer(&translator, &update, true);
+
+    let fork = server_request(
+        translator.from_client(&json!({"jsonrpc": "2.0", "id": 4, "method": "session/fork",
+            "params": {"sessionId": "t", "cwd": "/w", "mcpServers": []}})),
+        "thread/fork",
+    );
+    let mut r = json!({"thread": {"id": "f", "cwd": "/w"}});
+    r.as_object_mut().unwrap().extend(elsewhere.as_object().unwrap().clone());
+    let outs = translator.from_server(&json!({"jsonrpc": "2.0", "id": fork["id"], "result": r}));
+    let update = server_request(outs, "thread/settings/update");
+    assert_eq!(update["params"]["threadId"], "f", "{update}");
+    assert_eq!(update["params"]["permissions"], id, "{update}");
+}
+
+#[test]
+fn a_title_thread_codex_did_not_put_in_the_profile_never_runs() {
+    for (active, runs) in [(None, false), (Some(":read-only"), false), (Some("the profile"), true)] {
+        let translator = translator(CURRENT, "agent");
+        let id = profile_of(&new_session(&translator, json!([])));
+        let mut outs = Vec::new();
+        translator.state.lock().unwrap().generate_title("t", Some("fix the build".into()), &mut outs);
+        let start = server_request(outs, "thread/start");
+        let mut r = json!({"thread": {"id": "title", "cwd": "/w"}, "approvalPolicy": "never",
+            "sandbox": {"type": "readOnly"}});
+        if let Some(active) = active {
+            r["activePermissionProfile"] = json!({"id": if runs { id.as_str() } else { active }});
+        }
+        let outs = translator.from_server(&json!({"jsonrpc": "2.0", "id": start["id"], "result": r}));
+        assert_eq!(!server_requests(&outs, "turn/start").is_empty(), runs, "{active:?}: {outs:?}");
+    }
 }
 
 #[test]
