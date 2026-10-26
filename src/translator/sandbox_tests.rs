@@ -235,6 +235,81 @@ fn a_cancel_drops_work_that_waits_for_the_mode() {
 }
 
 #[test]
+fn work_waits_for_the_last_mode_picked_not_an_older_one() {
+    // Read-only, then back to agent, both on their way; a review waits.
+    let translator = translator(CURRENT, "agent");
+    let id = profile_of(&new_session(&translator, json!([])));
+    let older = assert_selects_profile(&set_mode(&translator, "read-only"), &id);
+    let newer = server_request(set_mode(&translator, "agent"), "thread/settings/update");
+    let outs = translator.from_client(&json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+        "params": {"sessionId": "t", "prompt": [{"type": "text", "text": "/review"}]}}));
+    assert!(work(&outs).is_none(), "the review started before Codex took the mode: {outs:?}");
+    // The older pick is refused: the review still waits for the newer one.
+    let outs = answer(&translator, &older, false);
+    assert!(prompt_answer(&outs).is_none() && work(&outs).is_none(), "{outs:?}");
+    let outs = answer(&translator, &newer, true);
+    assert!(work(&outs).is_some(), "the review did not start once Codex took the mode: {outs:?}");
+}
+
+/// A `session/resume` of `t` sent now, answered by `answer_resume` with
+/// Codex's view of the thread.
+fn resume_request(translator: &Translator) -> Value {
+    server_request(
+        translator.from_client(&json!({"jsonrpc": "2.0", "id": 4, "method": "session/resume",
+            "params": {"sessionId": "t", "cwd": "/w", "mcpServers": []}})),
+        "thread/resume",
+    )
+}
+
+fn answer_resume(translator: &Translator, request: &Value, view: Value) -> Vec<Out> {
+    let mut r = json!({"thread": {"id": "t", "cwd": "/w"}});
+    r.as_object_mut().unwrap().extend(view.as_object().unwrap().clone());
+    translator.from_server(&json!({"jsonrpc": "2.0", "id": request["id"], "result": r}))
+}
+
+#[test]
+fn a_mode_picked_while_a_resume_is_on_its_way_stays_the_sessions_mode() {
+    // Read-only, resumed; full access picked before the resume answers.
+    let translator = translator(CURRENT, "read-only");
+    let id = profile_of(&new_session(&translator, json!([])));
+    let resume = resume_request(&translator);
+    let update = server_request(set_mode(&translator, "agent-full-access"), "thread/settings/update");
+    let outs = answer_resume(
+        &translator,
+        &resume,
+        json!({"approvalPolicy": "on-request",
+        "sandbox": {"type": "readOnly"}, "activePermissionProfile": {"id": id, "extends": ":read-only"}}),
+    );
+    assert!(server_requests(&outs, "thread/settings/update").is_empty(), "a second update: {outs:?}");
+    answer(&translator, &update, true);
+    assert_eq!(translator.state.lock().unwrap().threads["t"].mode, "agent-full-access");
+
+    // Full access, resumed; read-only picked before the resume answers with
+    // the thread as it was: the session is read-only, and Codex has it once
+    // the update is through.
+    let translator = self::translator(CURRENT, "agent-full-access");
+    new_session(&translator, json!([]));
+    let resume = resume_request(&translator);
+    let update = assert_selects_profile(&set_mode(&translator, "read-only"), &id_of(&translator));
+    let outs = answer_resume(
+        &translator,
+        &resume,
+        json!({"approvalPolicy": "never",
+        "sandbox": {"type": "dangerFullAccess"}}),
+    );
+    assert!(server_requests(&outs, "thread/settings/update").is_empty(), "a second update: {outs:?}");
+    answer(&translator, &update, true);
+    assert_eq!(translator.state.lock().unwrap().threads["t"].mode, "read-only");
+    let params = turn(&translator);
+    assert!(params.get("permissions").is_none() && params.get("sandboxPolicy").is_none(), "{params}");
+}
+
+/// The read-only profile id `translator` defines.
+fn id_of(translator: &Translator) -> String {
+    translator.state.lock().unwrap().read_only_profile.clone()
+}
+
+#[test]
 fn a_resumed_or_forked_read_only_session_stays_in_the_profile() {
     let translator = translator(CURRENT, "read-only");
     let id = profile_of(&new_session(&translator, json!([])));
