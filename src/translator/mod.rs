@@ -330,12 +330,13 @@ impl State {
     }
 
     /// Sends the session's mode to Codex now when Codex does not have it
-    /// yet, so whatever runs next (a turn, a review, a goal's turns) runs in it.
+    /// yet and no update of it is on its way, so whatever runs next (a turn,
+    /// a review, a goal's turns) runs in it.
     pub(super) fn apply_mode(&mut self, sid: &str, out: &mut Vec<Out>) {
-        if self.mode_settled(sid) {
+        let Some(t) = self.threads.get(sid) else { return };
+        if t.mode == t.applied_mode {
             return;
         }
-        let Some(t) = self.threads.get(sid) else { return };
         let Some(mode) = config::mode(&t.mode) else { return };
         let mut params = json!({"threadId": sid, "approvalPolicy": mode.approval});
         self.mode_sandbox(mode, "sandboxPolicy", &mut params);
