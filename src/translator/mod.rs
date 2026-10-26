@@ -108,10 +108,12 @@ enum Pending {
         thread: String,
         wait: commands::CommandWait,
     },
-    /// `thread/settings/update` of a session's mode: on an error the mode
-    /// counts as not applied, so the next turn sends it again.
+    /// `thread/settings/update` of a session's mode, the thread's `nth`:
+    /// on an error of the latest one the mode counts as not applied, so the
+    /// next turn sends it again. An older one's answer changes nothing.
     ModeApply {
         thread: String,
+        nth: u64,
     },
     /// Fire and forget (`turn/interrupt`, `thread/unsubscribe` on close).
     Ignore,
@@ -159,6 +161,8 @@ struct Thread {
     /// only when `mode` differs, so the user's own sandbox settings (extra
     /// writable roots, network) stay in force otherwise.
     applied_mode: String,
+    /// How many mode updates were sent (`Pending::ModeApply::nth`).
+    mode_gen: u64,
     model: String,
     effort: String,
     /// The running turn.
@@ -325,8 +329,12 @@ impl State {
     /// Whether Codex has the session's mode: it took it, and no update of it
     /// is still on its way (one that fails would leave the old mode).
     pub(super) fn mode_settled(&self, sid: &str) -> bool {
-        self.threads.get(sid).is_some_and(|t| t.mode == t.applied_mode)
-            && !self.pending.values().any(|p| matches!(p, Pending::ModeApply { thread } if thread == sid))
+        self.threads.get(sid).is_some_and(|t| t.mode == t.applied_mode) && !self.mode_on_its_way(sid)
+    }
+
+    /// Whether a mode update of the thread awaits Codex's answer.
+    pub(super) fn mode_on_its_way(&self, sid: &str) -> bool {
+        self.pending.values().any(|p| matches!(p, Pending::ModeApply { thread, .. } if thread == sid))
     }
 
     /// Sends the session's mode to Codex now when Codex does not have it
@@ -340,10 +348,11 @@ impl State {
         let Some(mode) = config::mode(&t.mode) else { return };
         let mut params = json!({"threadId": sid, "approvalPolicy": mode.approval});
         self.mode_sandbox(mode, "sandboxPolicy", &mut params);
-        if let Some(t) = self.threads.get_mut(sid) {
-            t.applied_mode = t.mode.clone();
-        }
-        out.push(self.send(Pending::ModeApply { thread: sid.to_owned() }, "thread/settings/update", params));
+        let t = self.threads.get_mut(sid).expect("checked above");
+        t.applied_mode = t.mode.clone();
+        t.mode_gen += 1;
+        let pending = Pending::ModeApply { thread: sid.to_owned(), nth: t.mode_gen };
+        out.push(self.send(pending, "thread/settings/update", params));
     }
 
     /// Whether this app-server takes audio input: the caller opted in and the

@@ -74,14 +74,16 @@ impl State {
                 }
             }
             Pending::ModelList | Pending::Ignore => {}
-            Pending::ModeApply { thread } => {
-                // The next turn sends the mode with it; work that waited for it fails.
+            Pending::ModeApply { thread, nth } => {
+                // The latest update refused: the next turn sends the mode with
+                // it, and work that waited for it fails. An older one refused
+                // changes nothing; the newer one decides.
                 let waiting = match self.threads.get_mut(&thread) {
-                    Some(t) => {
+                    Some(t) if t.mode_gen == nth => {
                         t.applied_mode.clear();
                         std::mem::take(&mut t.after_mode)
                     }
-                    None => Vec::new(),
+                    _ => Vec::new(),
                 };
                 for (pending, _, _) in waiting {
                     self.server_error(pending, e, out);
@@ -130,7 +132,7 @@ impl State {
                 out.push(self.send(Pending::ModelList, "model/list", json!({})));
                 self.drain_queued(out);
             }
-            Pending::ModeApply { thread } => {
+            Pending::ModeApply { thread, .. } => {
                 if self.mode_settled(&thread) {
                     let waiting = self.threads.get_mut(&thread).map(|t| std::mem::take(&mut t.after_mode));
                     for (pending, method, params) in waiting.unwrap_or_default() {
@@ -166,10 +168,21 @@ impl State {
             },
             Pending::ThreadResume { client, session, mode, replay, titles } => {
                 let effort = self.threads.get(&session).map(|t| t.effort.clone());
+                // A mode picked while the resume was on its way stays the
+                // session's, and its own update settles it.
+                let picked = self
+                    .threads
+                    .get(&session)
+                    .filter(|t| t.mode != mode || self.mode_on_its_way(&session))
+                    .map(|t| (t.mode.clone(), t.applied_mode.clone()));
                 let Some(sid) = self.adopt_thread(r, mode, effort) else {
                     return out.push(Out::Client(err(&client, INTERNAL, "thread/resume returned no thread")));
                 };
-                if !self.resumed_read_only(&sid, r)
+                if let Some((mode, applied)) = picked.filter(|_| sid == session)
+                    && let Some(t) = self.threads.get_mut(&sid)
+                {
+                    (t.mode, t.applied_mode) = (mode, applied);
+                } else if !self.resumed_read_only(&sid, r)
                     && let Some(t) = self.threads.get_mut(&sid)
                 {
                     t.applied_mode.clear();
