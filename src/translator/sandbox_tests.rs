@@ -156,28 +156,82 @@ fn a_switch_codex_refused_goes_with_the_next_turn() {
     assert!(params.get("sandboxPolicy").is_none(), "{params}");
 }
 
+/// The work a command prompt sent the app-server (`review/start`,
+/// `thread/goal/set`), if any.
+fn work(outs: &[Out]) -> Option<Value> {
+    outs.iter().find_map(|o| match o {
+        Out::Server(m) if m["method"] == "review/start" || m["method"] == "thread/goal/set" => Some(m.clone()),
+        _ => None,
+    })
+}
+
+fn answer(translator: &Translator, request: &Value, ok: bool) -> Vec<Out> {
+    let reply = if ok {
+        json!({"jsonrpc": "2.0", "id": request["id"], "result": {}})
+    } else {
+        json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32600, "message": "profile refused"}})
+    };
+    translator.from_server(&reply)
+}
+
+/// The prompt's answer among `outs` (request id 3).
+fn prompt_answer(outs: &[Out]) -> Option<Value> {
+    outs.iter().find_map(|o| match o {
+        Out::Client(m) if m["id"] == 3 && m.get("method").is_none() => Some(m.clone()),
+        _ => None,
+    })
+}
+
 #[test]
-fn a_review_or_goal_after_a_refused_switch_runs_in_the_profile() {
+fn a_review_or_goal_starts_only_once_codex_took_the_mode() {
+    for command in ["/review", "/goal tidy up"] {
+        let translator = translator(CURRENT, "agent");
+        let id = profile_of(&new_session(&translator, json!([])));
+        // The switch is still on its way: the work waits for it.
+        let update = assert_selects_profile(&set_mode(&translator, "read-only"), &id);
+        let outs = translator.from_client(&json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": "t", "prompt": [{"type": "text", "text": command}]}}));
+        assert!(work(&outs).is_none(), "{command} started before Codex took the mode: {outs:?}");
+        let outs = answer(&translator, &update, true);
+        assert!(work(&outs).is_some(), "{command} did not start once Codex took the mode: {outs:?}");
+    }
+}
+
+#[test]
+fn a_review_or_goal_never_starts_in_the_old_mode() {
     for command in ["/review", "/goal tidy up"] {
         let translator = translator(CURRENT, "agent");
         let id = profile_of(&new_session(&translator, json!([])));
         let update = assert_selects_profile(&set_mode(&translator, "read-only"), &id);
-        translator
-            .from_server(&json!({"jsonrpc": "2.0", "id": update["id"], "error": {"code": -32600, "message": "no"}}));
-        let outs = prompt(&translator, command);
-        let work = outs
-            .iter()
-            .position(
-                |o| matches!(o, Out::Server(m) if m["method"] == "review/start" || m["method"] == "thread/goal/set"),
-            )
-            .unwrap_or_else(|| panic!("{command} started nothing: {outs:?}"));
-        let settings = outs
-            .iter()
-            .position(|o| matches!(o, Out::Server(m) if m["method"] == "thread/settings/update"))
-            .unwrap_or_else(|| panic!("{command} did not apply the mode: {outs:?}"));
-        assert!(settings < work, "{command}: the mode must reach Codex before the work starts");
-        assert_selects_profile(&outs, &id);
+        answer(&translator, &update, false);
+        // The command sends the mode again and waits for it.
+        let outs = translator.from_client(&json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": "t", "prompt": [{"type": "text", "text": command}]}}));
+        assert!(work(&outs).is_none(), "{command} started before Codex took the mode: {outs:?}");
+        let retry = assert_selects_profile(&outs, &id);
+        // Refused again: the prompt fails and nothing starts.
+        let outs = answer(&translator, &retry, false);
+        assert!(work(&outs).is_none(), "{command} started in the old mode: {outs:?}");
+        let answer = prompt_answer(&outs).unwrap_or_else(|| panic!("{command}: the prompt was not answered: {outs:?}"));
+        assert!(answer.get("error").is_some(), "{command}: {answer}");
+        let t = translator.state.lock().unwrap();
+        let t = &t.threads["t"];
+        assert!(t.prompt.is_none() && !t.starting, "{command}: {t:?}");
     }
+}
+
+#[test]
+fn a_cancel_drops_work_that_waits_for_the_mode() {
+    let translator = translator(CURRENT, "agent");
+    let id = profile_of(&new_session(&translator, json!([])));
+    let update = assert_selects_profile(&set_mode(&translator, "read-only"), &id);
+    translator.from_client(&json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+        "params": {"sessionId": "t", "prompt": [{"type": "text", "text": "/review"}]}}));
+    let outs =
+        translator.from_client(&json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "t"}}));
+    let answer_ = prompt_answer(&outs).expect("the prompt's answer");
+    assert_eq!(answer_["result"]["stopReason"], "cancelled");
+    assert!(work(&answer(&translator, &update, true)).is_none(), "a cancelled review started");
 }
 
 #[test]
@@ -217,6 +271,21 @@ fn a_resume_codex_did_not_apply_is_applied_after_it() {
     // Resumed in the profile: nothing more to send.
     let outs = resume(json!({"approvalPolicy": "on-request", "sandbox": {"type": "readOnly"},
         "activePermissionProfile": {"id": id, "extends": ":read-only"}}));
+    assert!(server_requests(&outs, "thread/settings/update").is_empty(), "{outs:?}");
+}
+
+#[test]
+fn a_resume_never_widens_what_codex_runs() {
+    // An agent session whose thread Codex still runs read-only stays so.
+    let translator = translator(CURRENT, "agent");
+    new_session(&translator, json!([]));
+    let request = server_request(
+        translator.from_client(&json!({"jsonrpc": "2.0", "id": 4, "method": "session/resume",
+            "params": {"sessionId": "t", "cwd": "/w", "mcpServers": []}})),
+        "thread/resume",
+    );
+    let outs = translator.from_server(&json!({"jsonrpc": "2.0", "id": request["id"], "result": {
+        "thread": {"id": "t", "cwd": "/w"}, "approvalPolicy": "untrusted", "sandbox": {"type": "readOnly"}}}));
     assert!(server_requests(&outs, "thread/settings/update").is_empty(), "{outs:?}");
 }
 
