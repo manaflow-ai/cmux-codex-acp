@@ -371,7 +371,13 @@ impl State {
                 }
                 let params =
                     json!({"threadId": sid, "input": [{"type": "text", "text": IMPLEMENT_PLAN, "text_elements": []}]});
-                out.push(self.send(Pending::TurnStart { client, thread: sid.to_owned() }, "turn/start", params));
+                self.send_in_mode(
+                    sid,
+                    Pending::TurnStart { client, thread: sid.to_owned() },
+                    "turn/start",
+                    params,
+                    out,
+                );
             }
         }
     }
@@ -418,7 +424,7 @@ impl State {
                 self.begin_command_turn(id, sid);
                 let params = json!({"threadId": sid, "target": target, "delivery": "inline"});
                 let pending = Pending::TurnStart { client: id.clone(), thread: sid.to_owned() };
-                out.push(self.send(pending, "review/start", params));
+                self.send_in_mode(sid, pending, "review/start", params, out);
             }
             "status" => wait(self, CommandWait::StatusAccount, "account/read", json!({"refreshToken": false}), out),
             "rename" => {
@@ -456,7 +462,9 @@ impl State {
                         json!({"threadId": sid, "objective": rest, "status": "active"})
                     };
                     self.begin_command_turn(id, sid);
-                    wait(self, CommandWait::GoalActive, "thread/goal/set", params, out);
+                    let pending =
+                        Pending::Command { client: id.clone(), thread: sid.to_owned(), wait: CommandWait::GoalActive };
+                    self.send_in_mode(sid, pending, "thread/goal/set", params, out);
                 }
             },
             _ => return false,
@@ -602,6 +610,11 @@ impl State {
             }
             CommandWait::TitleThread(text) => {
                 let Some(title_thread) = r.pointer("/thread/id").and_then(Value::as_str) else { return };
+                // Codex did not start it read-only: no title, rather than a
+                // turn that could run a command outside the sandbox.
+                if !self.result_read_only(r) {
+                    return;
+                }
                 self.title_threads.insert(title_thread.to_owned(), (sid, String::new()));
                 let input = format!("{TITLE_PROMPT}\n\nUser's first message:\n{text}");
                 let params = json!({"threadId": title_thread, "input": [{"type": "text", "text": input, "text_elements": []}],
@@ -924,7 +937,11 @@ impl State {
         let Some(text) = text.filter(|t| !t.trim().is_empty()) else { return };
         t.title_generated = true;
         let cwd = t.cwd.clone();
-        let mut params = json!({"ephemeral": true});
+        // It only writes a title: read-only, asking nothing, whatever the
+        // session's mode or the user's defaults.
+        let mut params = json!({"ephemeral": true, "approvalPolicy": "never"});
+        self.mode_sandbox(config::mode("read-only").expect("read-only mode"), "sandbox", &mut params);
+        self.thread_config(None, &mut params);
         if !cwd.is_empty() {
             params["cwd"] = json!(cwd);
         }

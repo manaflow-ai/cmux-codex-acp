@@ -62,6 +62,15 @@ def ts_result(cwd):
     return {"thread": thread(cwd), "model": "gpt-6-astra", "modelProvider": "openai", "cwd": cwd,
             "approvalPolicy": "on-request", "sandbox": {"type": "workspaceWrite"}, "reasoningEffort": "medium"}
 
+def applied(r, p):
+    """What Codex reports it applied: the permission profile or sandbox asked for."""
+    if p.get("permissions"):
+        r["activePermissionProfile"] = {"id": p["permissions"], "extends": ":read-only"}
+        r["sandbox"] = {"type": "readOnly"}
+    elif p.get("sandbox") == "read-only":
+        r["sandbox"] = {"type": "readOnly"}
+    return r
+
 def ev(method, **p): send({"method": method, "params": p})
 
 def simple_reply(th, tid, text):
@@ -217,9 +226,9 @@ while True:
         send({"id": rid, "result": {"config": {"model": "gpt-6-astra"}, "origins": {}}})
     elif meth == "thread/start" and p.get("ephemeral"):
         r = ts_result(cwd); r["thread"] = dict(r["thread"], id="title-thread-%s" % rid)
-        send({"id": rid, "result": r})
+        send({"id": rid, "result": applied(r, p)})
     elif meth in ("thread/start", "thread/fork"):
-        send({"id": rid, "result": ts_result(cwd)})
+        send({"id": rid, "result": applied(ts_result(cwd), p)})
     elif meth in ("thread/resume", "thread/read"):
         hist = [{"id": "turn-old", "status": "completed", "error": None, "items": [
             {"type": "userMessage", "id": "u0", "content": [{"type": "text", "text": "earlier question", "text_elements": []}]},
