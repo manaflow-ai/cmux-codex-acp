@@ -36,7 +36,8 @@ fn new_session(translator: &Translator, mcp: Value) -> Value {
             "params": {"cwd": "/w", "mcpServers": mcp}})),
         "thread/start",
     );
-    translator.from_server(&json!({"jsonrpc": "2.0", "id": start["id"], "result": {"thread": {"id": "t", "cwd": "/w"}}}));
+    translator
+        .from_server(&json!({"jsonrpc": "2.0", "id": start["id"], "result": {"thread": {"id": "t", "cwd": "/w"}}}));
     start["params"].clone()
 }
 
@@ -78,8 +79,7 @@ fn a_read_only_session_starts_in_the_profile() {
 #[test]
 fn every_session_defines_the_profile_beside_its_mcp_servers() {
     let translator = translator(CURRENT, "agent");
-    let params =
-        new_session(&translator, json!([{"name": "gh", "command": "/bin/gh", "args": ["mcp"], "env": []}]));
+    let params = new_session(&translator, json!([{"name": "gh", "command": "/bin/gh", "args": ["mcp"], "env": []}]));
     assert_eq!(params["sandbox"], "workspace-write");
     assert!(params.get("permissions").is_none());
     assert_defines_profile(&params);

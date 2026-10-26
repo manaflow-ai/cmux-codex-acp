@@ -72,7 +72,9 @@ fn answer(stream: TcpStream, kept: &Mutex<Vec<Value>>, command: &str) {
         return;
     }
     let mut stream = stream;
-    if !(request_line.starts_with("POST ") && request_line.split_whitespace().nth(1).is_some_and(|p| p.ends_with("/responses"))) {
+    if !(request_line.starts_with("POST ")
+        && request_line.split_whitespace().nth(1).is_some_and(|p| p.ends_with("/responses")))
+    {
         let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
         return;
     }
