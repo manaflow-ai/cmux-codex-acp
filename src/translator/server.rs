@@ -75,9 +75,16 @@ impl State {
             }
             Pending::ModelList | Pending::Ignore => {}
             Pending::ModeApply { thread } => {
-                // The next turn sends the mode with it.
-                if let Some(t) = self.threads.get_mut(&thread) {
-                    t.applied_mode.clear();
+                // The next turn sends the mode with it; work that waited for it fails.
+                let waiting = match self.threads.get_mut(&thread) {
+                    Some(t) => {
+                        t.applied_mode.clear();
+                        std::mem::take(&mut t.after_mode)
+                    }
+                    None => Vec::new(),
+                };
+                for (pending, _, _) in waiting {
+                    self.server_error(pending, e, out);
                 }
             }
             Pending::TurnStart { client, thread } => {
@@ -123,7 +130,14 @@ impl State {
                 out.push(self.send(Pending::ModelList, "model/list", json!({})));
                 self.drain_queued(out);
             }
-            Pending::ModeApply { .. } => {}
+            Pending::ModeApply { thread } => {
+                if self.mode_settled(&thread) {
+                    let waiting = self.threads.get_mut(&thread).map(|t| std::mem::take(&mut t.after_mode));
+                    for (pending, method, params) in waiting.unwrap_or_default() {
+                        out.push(self.send(pending, &method, params));
+                    }
+                }
+            }
             Pending::ModelList => {
                 self.models = config::parse_models(r);
                 let default = self.models.iter().find(|m| m.is_default).map(|m| m.id.clone());
@@ -155,9 +169,7 @@ impl State {
                 let Some(sid) = self.adopt_thread(r, mode, effort) else {
                     return out.push(Out::Client(err(&client, INTERNAL, "thread/resume returned no thread")));
                 };
-                // Codex ignores a resume's overrides for a thread it still has
-                // loaded: unless it answers with the mode's settings, send them.
-                if !self.resumed_in_mode(&sid, r)
+                if !self.resumed_read_only(&sid, r)
                     && let Some(t) = self.threads.get_mut(&sid)
                 {
                     t.applied_mode.clear();

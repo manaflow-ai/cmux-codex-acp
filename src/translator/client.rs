@@ -393,6 +393,16 @@ impl State {
     /// Interrupts the session's turn and its subagents' turns.
     pub(super) fn cancel(&mut self, sid: &str, out: &mut Vec<Out>) {
         self.end_command_prompts(sid, "cancelled", out);
+        // Work still waiting for the mode never starts.
+        if let Some(t) = self.threads.get_mut(sid)
+            && !t.after_mode.is_empty()
+        {
+            t.after_mode.clear();
+            (t.starting, t.command_turn, t.compacting) = (false, false, false);
+            if let Some(prompt) = t.prompt.take() {
+                out.push(Out::Client(ok(&prompt, json!({"stopReason": "cancelled"}))));
+            }
+        }
         // A plan review still open: withdraw it, and the prompt ends cancelled.
         if let Some(t) = self.threads.get_mut(sid)
             && let Some((ask, _)) = t.plan_review.take()

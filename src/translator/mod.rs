@@ -211,6 +211,10 @@ struct Thread {
     ignore_turn: Option<String>,
     /// The title was generated (or asked for) once.
     title_generated: bool,
+    /// Work that waits for Codex to take the session's mode (a review, a
+    /// goal, a plan's implementation): sent once the mode update succeeds,
+    /// failed with its error when it fails (`send_in_mode`).
+    after_mode: Vec<(Pending, String, Value)>,
     /// The running prompt's text, for the title thread.
     prompt_text: Option<String>,
 }
@@ -283,19 +287,39 @@ impl State {
         }
     }
 
-    /// Whether a `thread/resume` result shows the session's mode in force: its
-    /// approval policy, and the read-only profile or the mode's sandbox type.
-    pub(super) fn resumed_in_mode(&self, sid: &str, r: &Value) -> bool {
-        let Some(mode) = self.threads.get(sid).and_then(|t| config::mode(&t.mode)) else { return false };
-        if r.get("approvalPolicy").and_then(Value::as_str) != Some(mode.approval) {
-            return false;
+    /// Whether a read-only session's `thread/resume` result shows Codex
+    /// running it read-only: in the profile (or, on an older app-server, the
+    /// read-only sandbox). Codex ignores a resume's overrides for a thread it
+    /// still has loaded. Only read-only is checked: a resume never moves a
+    /// thread to a wider mode than Codex has it in.
+    pub(super) fn resumed_read_only(&self, sid: &str, r: &Value) -> bool {
+        if self.threads.get(sid).is_none_or(|t| t.mode != "read-only") {
+            return true;
         }
-        let profile = r.pointer("/activePermissionProfile/id").and_then(Value::as_str);
-        if mode.id == "read-only" && self.read_only_profile() {
-            return profile == Some(self.read_only_profile.as_str());
+        if self.read_only_profile() {
+            r.pointer("/activePermissionProfile/id").and_then(Value::as_str) == Some(self.read_only_profile.as_str())
+        } else {
+            r.pointer("/sandbox/type").and_then(Value::as_str) == Some("readOnly")
         }
-        profile != Some(self.read_only_profile.as_str())
-            && r.pointer("/sandbox/type") == config::sandbox_policy(mode).get("type")
+    }
+
+    /// Sends `method` once Codex has the session's mode: now when it has it,
+    /// else after the mode update (`apply_mode`) succeeds. One that fails
+    /// fails this request too, so nothing starts in the previous mode.
+    pub(super) fn send_in_mode(
+        &mut self,
+        sid: &str,
+        pending: Pending,
+        method: &str,
+        params: Value,
+        out: &mut Vec<Out>,
+    ) {
+        self.apply_mode(sid, out);
+        if self.threads.contains_key(sid) && !self.mode_settled(sid) {
+            self.threads.get_mut(sid).expect("checked above").after_mode.push((pending, method.to_owned(), params));
+        } else {
+            out.push(self.send(pending, method, params));
+        }
     }
 
     /// Whether Codex has the session's mode: it took it, and no update of it
@@ -449,6 +473,8 @@ impl Translator {
             }
         }
         for t in st.threads.values_mut() {
+            // Their prompts are failed below.
+            t.after_mode.clear();
             if let Some((ask, _)) = t.plan_review.take() {
                 out.push(Out::Client(notification("$/cancel_request", json!({"requestId": ask}))));
             }

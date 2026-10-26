@@ -369,10 +369,15 @@ impl State {
                     }
                     return;
                 }
-                self.apply_mode(sid, out);
                 let params =
                     json!({"threadId": sid, "input": [{"type": "text", "text": IMPLEMENT_PLAN, "text_elements": []}]});
-                out.push(self.send(Pending::TurnStart { client, thread: sid.to_owned() }, "turn/start", params));
+                self.send_in_mode(
+                    sid,
+                    Pending::TurnStart { client, thread: sid.to_owned() },
+                    "turn/start",
+                    params,
+                    out,
+                );
             }
         }
     }
@@ -417,10 +422,9 @@ impl State {
                     _ => json!({"type": "commit", "sha": rest, "title": null}),
                 };
                 self.begin_command_turn(id, sid);
-                self.apply_mode(sid, out);
                 let params = json!({"threadId": sid, "target": target, "delivery": "inline"});
                 let pending = Pending::TurnStart { client: id.clone(), thread: sid.to_owned() };
-                out.push(self.send(pending, "review/start", params));
+                self.send_in_mode(sid, pending, "review/start", params, out);
             }
             "status" => wait(self, CommandWait::StatusAccount, "account/read", json!({"refreshToken": false}), out),
             "rename" => {
@@ -458,8 +462,9 @@ impl State {
                         json!({"threadId": sid, "objective": rest, "status": "active"})
                     };
                     self.begin_command_turn(id, sid);
-                    self.apply_mode(sid, out);
-                    wait(self, CommandWait::GoalActive, "thread/goal/set", params, out);
+                    let pending =
+                        Pending::Command { client: id.clone(), thread: sid.to_owned(), wait: CommandWait::GoalActive };
+                    self.send_in_mode(sid, pending, "thread/goal/set", params, out);
                 }
             },
             _ => return false,

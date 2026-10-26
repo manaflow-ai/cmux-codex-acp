@@ -60,8 +60,10 @@ the same profile and asks nothing.
 
 Config options: `model` (from `model/list`), `reasoning_effort` (the model's
 supported efforts), `mode`. A mode change goes to Codex at once
-(`thread/settings/update`), so a review or a goal's turns started next run in
-it too; a model or effort change goes with the next turn.
+(`thread/settings/update`). A review, a goal or a plan's implementation
+started next waits until Codex has taken it, and fails if Codex refuses it; a
+prompt carries the mode itself. A model or effort change goes with the next
+turn.
 
 ## ACP coverage
 
