@@ -41,7 +41,11 @@ jobs:
           if [ "$RUNNER_OS" = Linux ]; then
             sudo apt-get update -q
             sudo apt-get install -y -q bubblewrap
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            # GitHub's Ubuntu image restricts user namespaces through AppArmor;
+            # Blacksmith's kernel has no such knob, and allows them already.
+            if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            fi
           fi
       - name: Sandbox tests
         if: ${{ !cancelled() }}
