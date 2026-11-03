@@ -311,6 +311,12 @@ impl State {
         if self.read_only_profile() {
             let (key, value) = config::read_only_profile(&self.read_only_profile);
             cfg[key] = value;
+            // Codex refuses a config with profiles and no `default_permissions`.
+            // It loads the thread's config again without the request's `sandbox`
+            // (workspace routing before every model request), so the thread
+            // fails with "failed to load workspace requirements". The request's
+            // `sandbox` or `permissions` still wins; a reload falls to read-only.
+            cfg["default_permissions"] = json!(self.read_only_profile);
         }
         if cfg.as_object().is_some_and(|c| !c.is_empty()) {
             params["config"] = cfg;
