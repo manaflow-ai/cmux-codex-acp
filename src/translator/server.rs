@@ -74,6 +74,8 @@ impl State {
                 }
             }
             Pending::ModelList | Pending::Ignore | Pending::GoalRead { .. } => {}
+            Pending::Suggest { thread, turn, route } => self.suggestion_error(thread, turn, route, code, &message, out),
+            Pending::SuggestTurn { fork } => self.suggestion_turn_error(fork, out),
             Pending::ModeApply { thread, nth } => {
                 // The latest update refused: the next turn sends the mode with
                 // it, and work that waited for it fails. An older one refused
@@ -326,6 +328,8 @@ impl State {
                     self.server_error(Pending::GoalSend { client, thread, input }, &error, out);
                 }
             }
+            Pending::Suggest { thread, turn, route } => self.suggestion_result(thread, turn, route, r, out),
+            Pending::SuggestTurn { fork } => self.fork_turn_known(&fork, r, out),
             Pending::Ignore => {}
         }
     }
@@ -339,6 +343,7 @@ impl State {
             // A subagent thread whose parent this translator presents.
             "thread/started" => return self.thread_started(p.get("thread").unwrap_or(&Value::Null), out),
             _ if !known && self.title_line(method, p, out) => return,
+            _ if !known && self.prediction_line(method, p, out) => return,
             // Skills changed on disk (no thread): every session's `$skill` list again.
             "skills/changed" => {
                 for sid in self.roots() {
@@ -418,6 +423,7 @@ impl State {
                 self.goal_changed(sid, out);
             }
             "turn/completed" => self.turn_completed(sid, p.get("turn").unwrap_or(&Value::Null), out),
+            "thread/prediction/updated" => self.prediction_updated(sid, p, out),
             "item/started" => {
                 if let Some(item) = p.get("item") {
                     self.item(sid, item, false, out);
@@ -445,13 +451,11 @@ impl State {
                     json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": delta}}),
                 ));
             }
-            "item/reasoning/summaryPartAdded" => {
-                if p.get("summaryIndex").and_then(Value::as_u64).unwrap_or(0) > 0 {
-                    out.push(update(
-                        sid,
-                        json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "\n\n"}}),
-                    ));
-                }
+            "item/reasoning/summaryPartAdded" if p.get("summaryIndex").and_then(Value::as_u64).unwrap_or(0) > 0 => {
+                out.push(update(
+                    sid,
+                    json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "\n\n"}}),
+                ));
             }
             "item/commandExecution/outputDelta" => {
                 let (Some(item), Some(delta)) = (s(p, "itemId"), s(p, "delta")) else { return };
@@ -611,6 +615,10 @@ impl State {
                     r["usage"] = u;
                 }
                 out.push(Out::Client(ok(&prompt, r)));
+                // After the prompt's answer, so it never waits on the suggestion.
+                if status == Some("completed") && !command_turn {
+                    self.suggest(sid, turn_id, out);
+                }
             }
         }
     }
