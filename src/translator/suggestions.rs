@@ -211,7 +211,11 @@ impl State {
                     fork.clone(),
                     PredictionFork { session: thread, turn, fork_turn: None, spoiled: false, text: Vec::new() },
                 );
-                let params = json!({"threadId": fork, "input": [{"type": "text", "text": INSTRUCTIONS, "text_elements": []}], "effort": "low"});
+                // The fork only writes a prompt: read-only and asking nothing, whatever
+                // the chat's mode, so a tool it starts before its interrupt lands can't
+                // change anything (a full-access chat raises no approval to decline).
+                let mut params = json!({"threadId": fork, "input": [{"type": "text", "text": INSTRUCTIONS, "text_elements": []}], "effort": "low", "approvalPolicy": "never"});
+                self.mode_sandbox(config::mode("read-only").expect("read-only mode"), "sandboxPolicy", &mut params);
                 out.push(self.send(Pending::SuggestTurn { fork }, "turn/start", params));
             }
         }

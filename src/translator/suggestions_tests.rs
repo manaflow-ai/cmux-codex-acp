@@ -133,6 +133,12 @@ fn without_sample_a_hidden_prediction_fork_answers() {
     let start = request(&outs, "turn/start");
     assert_eq!(start["params"]["threadId"], "fork-1");
     assert_eq!(start["params"]["effort"], "low");
+    // Read-only and asking nothing, whatever the chat's mode.
+    assert_eq!(start["params"]["approvalPolicy"], "never");
+    assert!(
+        start["params"].get("permissions").is_some() || start["params"]["sandboxPolicy"]["type"] == "readOnly",
+        "{start}"
+    );
     // Nothing of the fork reaches the session.
     let mut seen = Vec::new();
     seen.extend(answer(&translator, &start, json!({"turn": {"id": "fork-turn"}})));
