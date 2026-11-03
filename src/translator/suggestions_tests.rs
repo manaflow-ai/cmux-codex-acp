@@ -365,3 +365,37 @@ fn the_next_prompt_interrupts_a_fork_still_predicting() {
     assert!(client_lines(&outs).is_empty());
     request(&outs, "thread/unsubscribe");
 }
+
+#[test]
+fn a_second_session_refused_after_the_route_moved_asks_again_there() {
+    let translator = setup(true);
+    translator.lock().threads.insert("u".into(), Thread { title_generated: true, ..Thread::default() });
+    let first = request(&run_turn(&translator, 1, "turn-1", "completed"), "thread/prediction/request");
+    // Session u finishes a turn while t's ask is still on its way.
+    let start = request(
+        &translator.from_client(&json!({"id": 2, "method": "session/prompt", "params": {
+            "sessionId": "u", "prompt": [{"type": "text", "text": "and here"}]}})),
+        "turn/start",
+    );
+    answer(&translator, &start, json!({"turn": {"id": "u-1"}}));
+    let outs =
+        tell(&translator, "turn/completed", json!({"threadId": "u", "turn": {"id": "u-1", "status": "completed"}}));
+    let second = request(&outs, "thread/prediction/request");
+    let outs = refuse(&translator, &first, -32601, "not implemented yet");
+    assert_eq!(request(&outs, "thread/sample")["params"]["threadId"], "t");
+    let outs = refuse(&translator, &second, -32601, "not implemented yet");
+    assert_eq!(request(&outs, "thread/sample")["params"]["threadId"], "u");
+    assert_eq!(translator.lock().suggestion_route, suggestions::Route::Sample);
+}
+
+#[test]
+fn closing_a_session_interrupts_its_prediction_fork() {
+    let translator = setup(true);
+    translator.lock().suggestion_route = suggestions::Route::Fork;
+    let outs = run_turn(&translator, 1, "turn-1", "completed");
+    let fork = request(&outs, "thread/fork");
+    let start = request(&answer(&translator, &fork, json!({"thread": {"id": "fork-1"}})), "turn/start");
+    answer(&translator, &start, json!({"turn": {"id": "fork-turn"}}));
+    let outs = translator.from_client(&json!({"id": 9, "method": "session/close", "params": {"sessionId": "t"}}));
+    assert_eq!(request(&outs, "turn/interrupt")["params"], json!({"threadId": "fork-1", "turnId": "fork-turn"}));
+}

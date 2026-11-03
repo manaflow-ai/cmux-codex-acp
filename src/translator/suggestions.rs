@@ -43,7 +43,7 @@ Reply with nothing at all if the next step is unclear, if the last turn failed o
 Match the user's language and tone. One line of 2 to 12 words, with no quotes, no markdown and no explanation.";
 
 /// How suggestions are asked of this app-server; see the module docs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(super) enum Route {
     #[default]
     Prediction,
@@ -232,14 +232,20 @@ impl State {
         // A sample has 30 s in Codex: a slower model (a router, a long
         // context) times every one out, so this connection forks instead.
         let too_slow = route == Route::Sample && code == INTERNAL && message.contains("timed out");
-        if !(code == METHOD_NOT_FOUND || too_slow) || route != self.suggestion_route {
+        if !(code == METHOD_NOT_FOUND || too_slow) {
             return;
         }
-        self.suggestion_route = match route {
-            Route::Prediction => Route::Sample,
-            Route::Sample => Route::Fork,
-            Route::Fork | Route::Unavailable => Route::Unavailable,
-        };
+        // Another session's refusal may have moved the route already: this
+        // ask is retried on the route the connection is on now.
+        if route == self.suggestion_route {
+            self.suggestion_route = match route {
+                Route::Prediction => Route::Sample,
+                Route::Sample => Route::Fork,
+                Route::Fork | Route::Unavailable => Route::Unavailable,
+            };
+        } else if route > self.suggestion_route {
+            return;
+        }
         if self.suggestion_current(&thread, &turn) {
             self.ask_suggestion(&thread, &turn, out);
         }

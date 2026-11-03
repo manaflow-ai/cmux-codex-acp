@@ -98,6 +98,10 @@ impl State {
                         out.push(Out::Server(ok(&a.server_id, cancelled_answer(&a))));
                     }
                 }
+                // Its prediction forks stop now, not when they finish.
+                for tid in &family {
+                    self.clear_suggestion(tid, out);
+                }
                 for tid in &family {
                     if let Some(mut t) = self.threads.remove(tid) {
                         if let Some(prompt) = t.prompt.take() {
