@@ -1,6 +1,7 @@
 //! ACP client -> app-server.
 
 use super::commands;
+use super::suggestions;
 use super::*;
 use crate::content;
 
@@ -167,6 +168,8 @@ impl State {
                 }
                 let result = if config_id == "mode" {
                     self.set_mode(sid, &value, out)
+                } else if config_id == suggestions::OPTION {
+                    self.set_suggestions(sid, &value, out)
                 } else {
                     self.set_option(sid, config_id, &value)
                 };
@@ -388,6 +391,8 @@ impl State {
         if t.turn.is_some() || t.starting || t.plan_review.is_some() || t.goal_prompt.is_some() {
             return out.push(Out::Client(err(&id, INTERNAL, "a turn is already running in this session")));
         }
+        // The person wrote their next prompt: the suggestion for it is gone.
+        self.clear_suggestion(&sid, out);
         if let Some((name, rest)) = commands::parse(&blocks)
             && self.command(&id, &sid, &name, &rest, out)
         {

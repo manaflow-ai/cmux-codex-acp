@@ -9,6 +9,9 @@ mod goals;
 mod history;
 mod requests;
 mod server;
+mod suggestions;
+#[cfg(test)]
+mod suggestions_tests;
 
 use crate::config::{self, ModelInfo};
 use serde_json::{Value, json};
@@ -48,6 +51,11 @@ pub struct Options {
     /// for itself with `_meta.cmux.generateTitle: false` on `session/new`,
     /// `load`, `resume` or `fork`.
     pub generate_titles: bool,
+    /// Suggest the person's next prompt after each completed turn
+    /// (`suggestions.rs`): a `prompt_suggestion` session update, and each
+    /// session's `prompt-suggestions` option. Off: neither, and no extra
+    /// model call.
+    pub prompt_suggestions: bool,
 }
 
 impl Default for Options {
@@ -61,6 +69,7 @@ impl Default for Options {
             effort: None,
             audio_input: false,
             generate_titles: true,
+            prompt_suggestions: false,
         }
     }
 }
@@ -136,6 +145,16 @@ enum Pending {
     ModeApply {
         thread: String,
         nth: u64,
+    },
+    /// A prompt suggestion's ask for `thread`'s `turn` (`suggestions.rs`).
+    Suggest {
+        thread: String,
+        turn: String,
+        route: suggestions::Route,
+    },
+    /// The `turn/start` of a prediction fork.
+    SuggestTurn {
+        fork: String,
     },
     /// Fire and forget (`turn/interrupt`, `thread/unsubscribe` on close).
     Ignore,
@@ -247,6 +266,12 @@ struct Thread {
     after_mode: Vec<(Pending, String, Value)>,
     /// The running prompt's text, for the title thread.
     prompt_text: Option<String>,
+    /// The session turned prompt suggestions off (`suggestions.rs`).
+    suggestions_off: bool,
+    /// The turn a suggestion is on its way for; any other answer is stale.
+    suggest_turn: Option<String>,
+    /// The client shows a suggestion of this session's.
+    suggestion_shown: bool,
 }
 
 struct State {
@@ -271,6 +296,10 @@ struct State {
     title_threads: HashMap<String, (String, String)>,
     /// The id of the permission profile `read-only` selects (`config::read_only_profile_id`).
     read_only_profile: String,
+    /// How this app-server is asked for prompt suggestions (`suggestions.rs`).
+    suggestion_route: suggestions::Route,
+    /// Prediction forks on their way, by fork thread id.
+    prediction_forks: HashMap<String, suggestions::PredictionFork>,
 }
 
 /// The first Codex app-server whose `turn/start` takes `{"type": "audio"}` input.
@@ -455,6 +484,8 @@ impl Translator {
                 account: None,
                 title_threads: HashMap::new(),
                 read_only_profile: config::read_only_profile_id(),
+                suggestion_route: suggestions::Route::default(),
+                prediction_forks: HashMap::new(),
             }),
         }
     }
@@ -539,6 +570,7 @@ impl Translator {
             t.command_turn = false;
         }
         st.title_threads.clear();
+        st.prediction_forks.clear();
         let queued: Vec<Value> = std::mem::take(&mut st.queued);
         for m in queued {
             if let Some(id) = m.get("id").filter(|_| m.get("method").is_some()) {
@@ -615,6 +647,7 @@ impl State {
             {
                 list.push(speed);
             }
+            list.extend(self.suggestion_option(thread));
         }
         options
     }

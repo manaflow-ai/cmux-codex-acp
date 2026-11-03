@@ -109,6 +109,17 @@ Notifications:
 | `model/rerouted` | `config_option_update` |
 | `turn/started`, `turn/completed` | turn state; the prompt's answer |
 | `serverRequest/resolved` | drops a permission request Codex no longer waits on |
+| `thread/prediction/updated` | `prompt_suggestion` (with `Options::prompt_suggestions`) |
+
+Prompt suggestions (`Options::prompt_suggestions`, `--prompt-suggestions`):
+after a prompt's turn completes in a root session, the translator asks Codex
+for the person's likely next message and sends it as
+`{"sessionUpdate": "prompt_suggestion", "suggestion": "<text>"}`; the next
+prompt (or the session's `prompt-suggestions` option set to `off`) clears it
+with `"suggestion": null`. It asks `thread/prediction/request` first; an
+app-server that answers -32601 moves the connection to `thread/sample`, then
+to a hidden ephemeral `thread/fork` in prediction mode. See
+`src/translator/suggestions.rs`.
 
 Items: `commandExecution` (execute, or read/search from Codex's parsed
 command actions), `fileChange` (edit, with whole-file before and after text
