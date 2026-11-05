@@ -87,6 +87,9 @@ fn assert_defines_profile(params: &Value, id: &str) {
     assert_eq!(profile["extends"], ":read-only", "profile: {params}");
     let filesystem = profile["filesystem"].as_object().expect("the profile's filesystem entries");
     assert!(filesystem.values().any(|access| access == "deny"), "no deny entry: {params}");
+    // Codex refuses a config with profiles and no `default_permissions` when it
+    // loads the thread's config again without the request's `sandbox`.
+    assert_eq!(params["config"]["default_permissions"], id, "no default_permissions: {params}");
 }
 
 /// The `thread/settings/update` a mode change sent, which must select the
