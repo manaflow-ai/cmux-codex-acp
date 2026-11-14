@@ -240,8 +240,13 @@ pub fn split_model(value: &str, models: &[ModelInfo]) -> (String, Option<String>
     }
 }
 
-/// ACP `mcpServers` as the app-server's `mcp_servers` config override.
-pub fn mcp_config(servers: Option<&Value>) -> Option<Value> {
+/// ACP `mcpServers` as the app-server's `mcp_servers` config override, in the session's folder
+/// `cwd`. Codex merges the override into an entry of the same name its config layers make, key by
+/// key, so each server also gets `enabled = true` and a stdio one `cwd`: a person's own entry of
+/// that name, turned off or with a folder of its own, never keeps the session's server off or
+/// starts it elsewhere. (Codex refuses a command beside a `url` of theirs; the client leaves such a
+/// server out.)
+pub fn mcp_config(servers: Option<&Value>, cwd: Option<&Value>) -> Option<Value> {
     let servers = servers?.as_array()?;
     let mut out = serde_json::Map::new();
     for s in servers {
@@ -258,7 +263,7 @@ pub fn mcp_config(servers: Option<&Value>) -> Option<Value> {
             Some("http") | Some("sse") => {
                 let Some(url) = s.get("url").and_then(Value::as_str) else { continue };
                 let headers = pairs("headers", "name", "value");
-                let mut e = json!({"url": url});
+                let mut e = json!({"url": url, "enabled": true});
                 if !headers.is_empty() {
                     e["http_headers"] = Value::Object(headers);
                 }
@@ -267,7 +272,10 @@ pub fn mcp_config(servers: Option<&Value>) -> Option<Value> {
             _ => {
                 let Some(command) = s.get("command").and_then(Value::as_str) else { continue };
                 let env = pairs("env", "name", "value");
-                let mut e = json!({"command": command, "args": s.get("args").cloned().unwrap_or_else(|| json!([]))});
+                let mut e = json!({"command": command, "args": s.get("args").cloned().unwrap_or_else(|| json!([])), "enabled": true});
+                if let Some(cwd) = cwd.filter(|c| c.is_string()) {
+                    e["cwd"] = cwd.clone();
+                }
                 if !env.is_empty() {
                     e["env"] = Value::Object(env);
                 }

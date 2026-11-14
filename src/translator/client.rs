@@ -269,7 +269,7 @@ impl State {
         if let Some(cwd) = p.get("cwd").filter(|c| c.is_string()) {
             params["cwd"] = cwd.clone();
         }
-        self.thread_config(config::mcp_config(p.get("mcpServers")), &mut params);
+        self.thread_config(config::mcp_config(p.get("mcpServers"), p.get("cwd")), &mut params);
         params
     }
 
