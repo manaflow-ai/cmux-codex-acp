@@ -318,6 +318,72 @@ pub fn mcp_server_env(base: Option<Value>, meta: Option<&Value>) -> Option<Value
     (!out.is_empty()).then_some(Value::Object(out))
 }
 
+/// `_meta.cmux.mcpServerEntry` on a session request (`{name: {command, args, env: {KEY: value}}}`)
+/// as `mcp_servers.<name>.command`, `.args` and `.env.<KEY>` config overrides, added to `base`:
+/// a person's own stdio server of that name, as the client read it from the config files Codex
+/// loads, with env keys added. Where the entry loads, Codex merges the same `command` and `args`
+/// and the keys into it; where it does not, the overrides are still a whole stdio server, never
+/// one with no command, which Codex refuses ("invalid transport"). Its other keys (`cwd`,
+/// `enabled`, timeouts) stay the person's. Skipped: a server the session defines itself, an
+/// entry with no string `command`, `args` that is not a list of strings, and names and keys as
+/// for [`mcp_server_env`].
+pub fn mcp_server_entry(base: Option<Value>, meta: Option<&Value>) -> Option<Value> {
+    let mut out = base.and_then(|b| b.as_object().cloned()).unwrap_or_default();
+    let ident = |s: &str, dash: bool| {
+        let mut chars = s.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || (dash && c == '-'))
+    };
+    for (name, entry) in meta.and_then(Value::as_object).into_iter().flatten() {
+        if !ident(name, true) || out.contains_key(&format!("mcp_servers.{name}")) {
+            continue;
+        }
+        let Some(command) = entry.get("command").and_then(Value::as_str) else { continue };
+        let args = match entry.get("args") {
+            None => Some(vec![]),
+            Some(Value::Array(list)) => list.iter().map(|a| a.as_str().map(str::to_owned)).collect(),
+            Some(_) => None,
+        };
+        let Some(args) = args else { continue };
+        out.insert(format!("mcp_servers.{name}.command"), json!(command));
+        out.insert(format!("mcp_servers.{name}.args"), json!(args));
+        for (key, value) in entry.get("env").and_then(Value::as_object).into_iter().flatten() {
+            if let (true, Some(value)) = (ident(key, false), value.as_str()) {
+                out.insert(format!("mcp_servers.{name}.env.{key}"), json!(value));
+            }
+        }
+    }
+    (!out.is_empty()).then_some(Value::Object(out))
+}
+
+#[cfg(test)]
+mod mcp_server_entry_tests {
+    use super::*;
+
+    /// A person's own entry goes in whole: its command, args and the env keys; a server the
+    /// session defines, an entry with no string command or with non-string args is skipped.
+    #[test]
+    fn a_persons_own_entry_goes_in_whole_with_its_env_keys() {
+        let meta = json!({"cmux": {"command": "/opt/cmux", "args": ["mcp", "serve"],
+                                   "env": {"CMUX_AGENT_TOOLS_ANSWER": "off", "A.B": "x", "N": 1}},
+                          "nocmd": {"args": []}, "badargs": {"command": "/x", "args": [1]}});
+        let cfg = mcp_server_entry(None, Some(&meta)).unwrap();
+        assert_eq!(
+            cfg,
+            json!({"mcp_servers.cmux.command": "/opt/cmux", "mcp_servers.cmux.args": ["mcp", "serve"],
+                   "mcp_servers.cmux.env.CMUX_AGENT_TOOLS_ANSWER": "off"})
+        );
+        let servers = json!([{"name": "cmux", "command": "/bin/c", "args": [], "env": []}]);
+        let both = mcp_server_entry(mcp_config(Some(&servers), None), Some(&meta)).unwrap();
+        assert!(both.get("mcp_servers.cmux.command").is_none(), "{both}");
+        assert_eq!(
+            mcp_server_entry(None, Some(&json!({"cmux": {"command": "/x"}}))).unwrap()["mcp_servers.cmux.args"],
+            json!([])
+        );
+        assert_eq!(mcp_server_entry(None, None), None);
+    }
+}
+
 #[cfg(test)]
 mod mcp_server_env_tests {
     use super::*;

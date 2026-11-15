@@ -516,3 +516,21 @@ fn a_resumed_or_forked_thread_gets_the_env_keys_too() {
         );
     }
 }
+
+/// `_meta.cmux.mcpServerEntry` reaches `thread/start` as the person's own entry, whole: its
+/// command and args with the env keys, never env keys alone.
+#[test]
+fn a_persons_own_entry_reaches_the_thread_whole() {
+    let translator = translator(CURRENT, "agent");
+    let start = server_request(
+        translator.from_client(&json!({"jsonrpc": "2.0", "id": 1, "method": "session/new",
+            "params": {"cwd": "/w", "mcpServers": [],
+                "_meta": {"cmux": {"mcpServerEntry": {"cmux": {"command": "/opt/cmux", "args": ["mcp", "serve"],
+                    "env": {"CMUX_AGENT_SESSION": "s-1"}}}}}}})),
+        "thread/start",
+    );
+    let config = &start["params"]["config"];
+    assert_eq!(config["mcp_servers.cmux.command"], "/opt/cmux", "{start}");
+    assert_eq!(config["mcp_servers.cmux.args"], json!(["mcp", "serve"]), "{start}");
+    assert_eq!(config["mcp_servers.cmux.env.CMUX_AGENT_SESSION"], "s-1", "{start}");
+}
