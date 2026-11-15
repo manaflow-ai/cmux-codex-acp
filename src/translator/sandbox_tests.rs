@@ -534,3 +534,20 @@ fn a_persons_own_entry_reaches_the_thread_whole() {
     assert_eq!(config["mcp_servers.cmux.args"], json!(["mcp", "serve"]), "{start}");
     assert_eq!(config["mcp_servers.cmux.env.CMUX_AGENT_SESSION"], "s-1", "{start}");
 }
+
+/// The same entry goes with a resumed and a forked thread, which start the person's server again.
+#[test]
+fn a_resumed_or_forked_thread_gets_the_persons_entry_too() {
+    let translator = translator(CURRENT, "agent");
+    let meta = json!({"cmux": {"mcpServerEntry": {"cmux": {"command": "/opt/cmux", "args": ["mcp", "serve"]}}}});
+    for (method, expect) in
+        [("session/load", "thread/resume"), ("session/resume", "thread/resume"), ("session/fork", "thread/fork")]
+    {
+        let request = server_request(
+            translator.from_client(&json!({"jsonrpc": "2.0", "id": 2, "method": method,
+                "params": {"sessionId": "t", "cwd": "/w", "mcpServers": [], "_meta": meta}})),
+            expect,
+        );
+        assert_eq!(request["params"]["config"]["mcp_servers.cmux.command"], "/opt/cmux", "{method}: {request}");
+    }
+}

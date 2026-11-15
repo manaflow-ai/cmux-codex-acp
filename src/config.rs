@@ -290,6 +290,14 @@ pub fn mcp_config(servers: Option<&Value>, cwd: Option<&Value>) -> Option<Value>
     (!out.is_empty()).then_some(Value::Object(out))
 }
 
+/// A plain identifier: `[A-Za-z_][A-Za-z0-9_]*`, with `-` too when `dash` (a server name). A name
+/// or key that is not one could name another config path, so it is skipped.
+fn ident(s: &str, dash: bool) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || (dash && c == '-'))
+}
+
 /// `_meta.cmux.mcpServerEnv` on a session request (`{name: {KEY: value}}`) as `mcp_servers.<name>.env.<KEY>`
 /// config overrides, added to `base` (from [`mcp_config`]): env keys for a person's own server of
 /// that name, which Codex merges into its entry. The client sends it only for a server it gives no
@@ -300,11 +308,6 @@ pub fn mcp_config(servers: Option<&Value>, cwd: Option<&Value>) -> Option<Value>
 /// `[A-Za-z_][A-Za-z0-9_]*` for a key) is skipped, so neither can name another config path.
 pub fn mcp_server_env(base: Option<Value>, meta: Option<&Value>) -> Option<Value> {
     let mut out = base.and_then(|b| b.as_object().cloned()).unwrap_or_default();
-    let ident = |s: &str, dash: bool| {
-        let mut chars = s.chars();
-        chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || (dash && c == '-'))
-    };
     for (name, env) in meta.and_then(Value::as_object).into_iter().flatten() {
         if !ident(name, true) || out.contains_key(&format!("mcp_servers.{name}")) {
             continue;
@@ -323,30 +326,33 @@ pub fn mcp_server_env(base: Option<Value>, meta: Option<&Value>) -> Option<Value
 /// a person's own stdio server of that name, as the client read it from the config files Codex
 /// loads, with env keys added. Where the entry loads, Codex merges the same `command` and `args`
 /// and the keys into it; where it does not, the overrides are still a whole stdio server, never
-/// one with no command, which Codex refuses ("invalid transport"). Its other keys (`cwd`,
-/// `enabled`, timeouts) stay the person's. Skipped: a server the session defines itself, an
-/// entry with no string `command`, `args` that is not a list of strings, and names and keys as
-/// for [`mcp_server_env`].
+/// one with no command, which Codex refuses ("invalid transport"); it then has no `cwd` and no
+/// `enabled` of its own (Codex's defaults: on, in the session's folder). Its other keys (`cwd`,
+/// `enabled`, timeouts) stay the person's. `command` and the `args` sent win over every config
+/// layer, so the client sends what the layers it read give; `args` goes only when sent. An HTTP
+/// entry of the person's must not get these: a `command` beside a `url` fails the whole thread,
+/// and that check is the client's. Skipped: a server the session defines itself, an entry with
+/// no string `command`, `args` that is not a list of strings, and names and keys that are not
+/// plain identifiers ([`ident`]).
 pub fn mcp_server_entry(base: Option<Value>, meta: Option<&Value>) -> Option<Value> {
     let mut out = base.and_then(|b| b.as_object().cloned()).unwrap_or_default();
-    let ident = |s: &str, dash: bool| {
-        let mut chars = s.chars();
-        chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || (dash && c == '-'))
-    };
     for (name, entry) in meta.and_then(Value::as_object).into_iter().flatten() {
         if !ident(name, true) || out.contains_key(&format!("mcp_servers.{name}")) {
             continue;
         }
         let Some(command) = entry.get("command").and_then(Value::as_str) else { continue };
-        let args = match entry.get("args") {
-            None => Some(vec![]),
-            Some(Value::Array(list)) => list.iter().map(|a| a.as_str().map(str::to_owned)).collect(),
+        let args: Option<Option<Vec<String>>> = match entry.get("args") {
+            None => Some(None),
+            Some(Value::Array(list)) => {
+                list.iter().map(|a| a.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>().map(Some)
+            }
             Some(_) => None,
         };
         let Some(args) = args else { continue };
         out.insert(format!("mcp_servers.{name}.command"), json!(command));
-        out.insert(format!("mcp_servers.{name}.args"), json!(args));
+        if let Some(args) = args {
+            out.insert(format!("mcp_servers.{name}.args"), json!(args));
+        }
         for (key, value) in entry.get("env").and_then(Value::as_object).into_iter().flatten() {
             if let (true, Some(value)) = (ident(key, false), value.as_str()) {
                 out.insert(format!("mcp_servers.{name}.env.{key}"), json!(value));
@@ -376,10 +382,21 @@ mod mcp_server_entry_tests {
         let servers = json!([{"name": "cmux", "command": "/bin/c", "args": [], "env": []}]);
         let both = mcp_server_entry(mcp_config(Some(&servers), None), Some(&meta)).unwrap();
         assert!(both.get("mcp_servers.cmux.command").is_none(), "{both}");
+        // No `args` sent: none goes, so a layer the client did not read keeps its own.
         assert_eq!(
-            mcp_server_entry(None, Some(&json!({"cmux": {"command": "/x"}}))).unwrap()["mcp_servers.cmux.args"],
-            json!([])
+            mcp_server_entry(None, Some(&json!({"cmux": {"command": "/x"}}))).unwrap(),
+            json!({"mcp_servers.cmux.command": "/x"})
         );
+        // `args` that is no list, or `env` that is no object: no entry, or no keys.
+        assert_eq!(mcp_server_entry(None, Some(&json!({"cmux": {"command": "/x", "args": "mcp"}}))), None);
+        assert_eq!(
+            mcp_server_entry(None, Some(&json!({"cmux": {"command": "/x", "env": "K=V"}}))).unwrap(),
+            json!({"mcp_servers.cmux.command": "/x"})
+        );
+        // With `mcpServerEnv` for the same server first: the entry's value of a key wins.
+        let env = mcp_server_env(None, Some(&json!({"cmux": {"K": "env"}})));
+        let both = mcp_server_entry(env, Some(&json!({"cmux": {"command": "/x", "env": {"K": "entry"}}}))).unwrap();
+        assert_eq!(both["mcp_servers.cmux.env.K"], "entry");
         assert_eq!(mcp_server_entry(None, None), None);
     }
 }
