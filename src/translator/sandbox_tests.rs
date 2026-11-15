@@ -478,3 +478,41 @@ fn an_app_server_without_the_profile_check_keeps_the_sandbox_mode() {
     assert_eq!(params["sandboxPolicy"]["type"], "readOnly", "{params}");
     assert!(params.get("permissions").is_none());
 }
+
+/// `_meta.cmux.mcpServerEnv` on a session request reaches `thread/start` as env overrides for the
+/// person's own server of that name (the client sends it where it gives no `cmux` of its own, so
+/// the person's entry knows which chat starts it).
+#[test]
+fn a_persons_own_server_gets_the_env_keys_the_client_names() {
+    let translator = translator(CURRENT, "agent");
+    let start = server_request(
+        translator.from_client(&json!({"jsonrpc": "2.0", "id": 1, "method": "session/new",
+            "params": {"cwd": "/w", "mcpServers": [],
+                "_meta": {"cmux": {"mcpServerEnv": {"cmux": {"CMUX_AGENT_SESSION": "s-1", "CMUX_AGENT_TOOLS_ANSWER": "off"}}}}}})),
+        "thread/start",
+    );
+    let config = &start["params"]["config"];
+    assert_eq!(config["mcp_servers.cmux.env.CMUX_AGENT_SESSION"], "s-1", "{start}");
+    assert_eq!(config["mcp_servers.cmux.env.CMUX_AGENT_TOOLS_ANSWER"], "off", "{start}");
+    assert!(config.get("mcp_servers.cmux").is_none(), "no definition of its own: {start}");
+}
+
+/// The same keys go with a resumed and a forked thread, which start the person's entry again.
+#[test]
+fn a_resumed_or_forked_thread_gets_the_env_keys_too() {
+    let translator = translator(CURRENT, "agent");
+    let meta = json!({"cmux": {"mcpServerEnv": {"cmux": {"CMUX_AGENT_SESSION": "s-1"}}}});
+    for (method, expect) in
+        [("session/load", "thread/resume"), ("session/resume", "thread/resume"), ("session/fork", "thread/fork")]
+    {
+        let request = server_request(
+            translator.from_client(&json!({"jsonrpc": "2.0", "id": 2, "method": method,
+                "params": {"sessionId": "t", "cwd": "/w", "mcpServers": [], "_meta": meta}})),
+            expect,
+        );
+        assert_eq!(
+            request["params"]["config"]["mcp_servers.cmux.env.CMUX_AGENT_SESSION"], "s-1",
+            "{method}: {request}"
+        );
+    }
+}
