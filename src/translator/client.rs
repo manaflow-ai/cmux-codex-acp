@@ -271,6 +271,7 @@ impl State {
         }
         let servers = config::mcp_config(p.get("mcpServers"), p.get("cwd"));
         let servers = config::mcp_server_env(servers, p.pointer("/_meta/cmux/mcpServerEnv"));
+        let servers = config::mcp_server_entry(servers, p.pointer("/_meta/cmux/mcpServerEntry"));
         self.thread_config(servers, &mut params);
         params
     }
