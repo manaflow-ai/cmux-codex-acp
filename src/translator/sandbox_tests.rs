@@ -136,6 +136,32 @@ fn every_session_defines_the_profile_beside_its_mcp_servers() {
     assert_eq!(params["config"]["mcp_servers.gh"]["command"], "/bin/gh");
 }
 
+/// Codex merges a `-c`/config override into an entry of the same name its config layers make, key
+/// by key: a person's own `[mcp_servers.cmux]` with `enabled = false` or its own `cwd` would keep
+/// the session's server off or start it elsewhere. Each server the client gives is turned on and
+/// runs in the session's folder, so those keys never come from the person's entry.
+#[test]
+fn each_given_server_is_on_and_runs_in_the_sessions_folder() {
+    let translator = translator(CURRENT, "agent");
+    let params = new_session(
+        &translator,
+        json!([
+            {"name": "cmux", "command": "/A/cmux", "args": ["mcp", "serve"], "env": [{"name": "K", "value": "v"}]},
+            {"name": "web", "type": "http", "url": "http://127.0.0.1:1/mcp", "headers": []},
+        ]),
+    );
+    let cmux = &params["config"]["mcp_servers.cmux"];
+    assert_eq!(cmux["command"], "/A/cmux");
+    assert_eq!(cmux["args"], json!(["mcp", "serve"]));
+    assert_eq!(cmux["env"], json!({"K": "v"}));
+    assert_eq!(cmux["enabled"], true, "{params}");
+    assert_eq!(cmux["cwd"], "/w", "{params}");
+    let web = &params["config"]["mcp_servers.web"];
+    assert_eq!(web["url"], "http://127.0.0.1:1/mcp");
+    assert_eq!(web["enabled"], true, "{params}");
+    assert!(web.get("cwd").is_none(), "an HTTP server has no working folder: {params}");
+}
+
 #[test]
 fn switching_to_read_only_selects_the_profile_at_once_and_back_selects_the_sandbox() {
     let translator = translator(CURRENT, "agent");
