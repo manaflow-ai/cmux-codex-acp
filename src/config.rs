@@ -290,6 +290,53 @@ pub fn mcp_config(servers: Option<&Value>, cwd: Option<&Value>) -> Option<Value>
     (!out.is_empty()).then_some(Value::Object(out))
 }
 
+/// `_meta.cmux.mcpServerEnv` on a session request (`{name: {KEY: value}}`) as `mcp_servers.<name>.env.<KEY>`
+/// config overrides, added to `base` (from [`mcp_config`]): env keys for a person's own server of
+/// that name, which Codex merges into its entry. The client sends it only for a server it gives no
+/// definition of, and only where the person's config has a stdio entry of that name (an override
+/// with no entry to merge into would be a server with no command, which Codex refuses). Only
+/// string values; a name or key with a dot, or an empty one, is skipped (it would name another key).
+pub fn mcp_server_env(base: Option<Value>, meta: Option<&Value>) -> Option<Value> {
+    let mut out = base.and_then(|b| b.as_object().cloned()).unwrap_or_default();
+    let plain = |s: &str| !s.is_empty() && !s.contains('.') && !s.contains('"');
+    for (name, env) in meta.and_then(Value::as_object).into_iter().flatten() {
+        if !plain(name) || out.contains_key(&format!("mcp_servers.{name}")) {
+            continue;
+        }
+        for (key, value) in env.as_object().into_iter().flatten() {
+            if let (true, Some(value)) = (plain(key), value.as_str()) {
+                out.insert(format!("mcp_servers.{name}.env.{key}"), json!(value));
+            }
+        }
+    }
+    (!out.is_empty()).then_some(Value::Object(out))
+}
+
+#[cfg(test)]
+mod mcp_server_env_tests {
+    use super::*;
+
+    /// Env keys for a person's own server become dotted `env` overrides; a server the session
+    /// defines itself, a dotted name or key, and a non-string value are skipped.
+    #[test]
+    fn env_keys_merge_into_a_persons_own_entry() {
+        let meta = json!({"cmux": {"CMUX_AGENT_SESSION": "s-1", "CMUX_AGENT_TOOLS_ANSWER": "off", "N": 1, "A.B": "x"},
+                          "a.b": {"K": "v"}});
+        let cfg = mcp_server_env(None, Some(&meta)).unwrap();
+        assert_eq!(
+            cfg,
+            json!({"mcp_servers.cmux.env.CMUX_AGENT_SESSION": "s-1", "mcp_servers.cmux.env.CMUX_AGENT_TOOLS_ANSWER": "off"})
+        );
+        // A server the session gives keeps its own definition; nothing is added for it.
+        let servers = json!([{"name": "cmux", "command": "/bin/c", "args": [], "env": []}]);
+        let both = mcp_server_env(mcp_config(Some(&servers), None), Some(&meta)).unwrap();
+        assert!(both.get("mcp_servers.cmux.env.CMUX_AGENT_SESSION").is_none(), "{both}");
+        assert_eq!(both["mcp_servers.cmux"]["command"], "/bin/c");
+        assert_eq!(mcp_server_env(None, None), None);
+        assert_eq!(mcp_server_env(None, Some(&json!({"cmux": {}}))), None);
+    }
+}
+
 #[cfg(test)]
 mod mcp_config_tests {
     use super::*;

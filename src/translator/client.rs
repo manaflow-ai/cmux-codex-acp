@@ -269,7 +269,9 @@ impl State {
         if let Some(cwd) = p.get("cwd").filter(|c| c.is_string()) {
             params["cwd"] = cwd.clone();
         }
-        self.thread_config(config::mcp_config(p.get("mcpServers"), p.get("cwd")), &mut params);
+        let servers = config::mcp_config(p.get("mcpServers"), p.get("cwd"));
+        let servers = config::mcp_server_env(servers, p.pointer("/_meta/cmux/mcpServerEnv"));
+        self.thread_config(servers, &mut params);
         params
     }
 
