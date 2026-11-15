@@ -294,17 +294,23 @@ pub fn mcp_config(servers: Option<&Value>, cwd: Option<&Value>) -> Option<Value>
 /// config overrides, added to `base` (from [`mcp_config`]): env keys for a person's own server of
 /// that name, which Codex merges into its entry. The client sends it only for a server it gives no
 /// definition of, and only where the person's config has a stdio entry of that name (an override
-/// with no entry to merge into would be a server with no command, which Codex refuses). Only
-/// string values; a name or key with a dot, or an empty one, is skipped (it would name another key).
+/// with no entry to merge into, or into an HTTP entry, fails the whole thread: Codex refuses a
+/// server with no command, and `env` beside a `url`; that check is the client's). Only string values;
+/// a name or key that is not a plain identifier (`[A-Za-z_][A-Za-z0-9_-]*` for a name,
+/// `[A-Za-z_][A-Za-z0-9_]*` for a key) is skipped, so neither can name another config path.
 pub fn mcp_server_env(base: Option<Value>, meta: Option<&Value>) -> Option<Value> {
     let mut out = base.and_then(|b| b.as_object().cloned()).unwrap_or_default();
-    let plain = |s: &str| !s.is_empty() && !s.contains('.') && !s.contains('"');
+    let ident = |s: &str, dash: bool| {
+        let mut chars = s.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || (dash && c == '-'))
+    };
     for (name, env) in meta.and_then(Value::as_object).into_iter().flatten() {
-        if !plain(name) || out.contains_key(&format!("mcp_servers.{name}")) {
+        if !ident(name, true) || out.contains_key(&format!("mcp_servers.{name}")) {
             continue;
         }
         for (key, value) in env.as_object().into_iter().flatten() {
-            if let (true, Some(value)) = (plain(key), value.as_str()) {
+            if let (true, Some(value)) = (ident(key, false), value.as_str()) {
                 out.insert(format!("mcp_servers.{name}.env.{key}"), json!(value));
             }
         }
@@ -334,6 +340,13 @@ mod mcp_server_env_tests {
         assert_eq!(both["mcp_servers.cmux"]["command"], "/bin/c");
         assert_eq!(mcp_server_env(None, None), None);
         assert_eq!(mcp_server_env(None, Some(&json!({"cmux": {}}))), None);
+        // No name or key that is not a plain identifier, no env that is not an object.
+        let odd = json!({"cmux": {"": "x", "K\"": "x", "K=V": "x", "1K": "x", "K K": "x"}, "a\"b": {"K": "v"}, "c": "x"});
+        assert_eq!(mcp_server_env(None, Some(&odd)), None);
+        // An HTTP server the session gives under that name keeps its definition too.
+        let http = json!([{"name": "cmux", "type": "http", "url": "http://127.0.0.1:1/mcp", "headers": []}]);
+        let cfg = mcp_server_env(mcp_config(Some(&http), None), Some(&meta)).unwrap();
+        assert_eq!(cfg, json!({"mcp_servers.cmux": {"url": "http://127.0.0.1:1/mcp", "enabled": true}}));
     }
 }
 
