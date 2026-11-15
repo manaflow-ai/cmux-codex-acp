@@ -244,7 +244,8 @@ pub fn split_model(value: &str, models: &[ModelInfo]) -> (String, Option<String>
 /// `cwd`. Codex merges the override into an entry of the same name its config layers make, key by
 /// key, so each server also gets `enabled = true` and a stdio one `cwd`: a person's own entry of
 /// that name, turned off or with a folder of its own, never keeps the session's server off or
-/// starts it elsewhere. (Codex refuses a command beside a `url` of theirs; the client leaves such a
+/// starts it elsewhere. Their other keys still merge (`enabled_tools`, `disabled_tools`, timeouts,
+/// extra `env`). (Codex refuses a command beside a `url` of theirs; the client leaves such a
 /// server out.)
 pub fn mcp_config(servers: Option<&Value>, cwd: Option<&Value>) -> Option<Value> {
     let servers = servers?.as_array()?;
@@ -287,4 +288,25 @@ pub fn mcp_config(servers: Option<&Value>, cwd: Option<&Value>) -> Option<Value>
         out.insert(format!("mcp_servers.{name}"), entry);
     }
     (!out.is_empty()).then_some(Value::Object(out))
+}
+
+#[cfg(test)]
+mod mcp_config_tests {
+    use super::*;
+
+    /// Without a session folder no `cwd` is sent (the person's entry keeps its own), and an `sse`
+    /// server, like an `http` one, gets `enabled` but never a `cwd`.
+    #[test]
+    fn no_session_folder_sends_no_cwd_and_remote_servers_never_get_one() {
+        let servers = json!([
+            {"name": "a", "command": "/bin/a", "args": [], "env": []},
+            {"name": "s", "type": "sse", "url": "http://127.0.0.1:1/sse", "headers": []},
+        ]);
+        let none = mcp_config(Some(&servers), None).unwrap();
+        assert_eq!(none["mcp_servers.a"], json!({"command": "/bin/a", "args": [], "enabled": true}));
+        let with = mcp_config(Some(&servers), Some(&json!("/w"))).unwrap();
+        assert_eq!(with["mcp_servers.a"]["cwd"], "/w");
+        assert_eq!(with["mcp_servers.s"], json!({"url": "http://127.0.0.1:1/sse", "enabled": true}));
+        assert!(mcp_config(Some(&servers), Some(&json!(7))).unwrap()["mcp_servers.a"].get("cwd").is_none());
+    }
 }
