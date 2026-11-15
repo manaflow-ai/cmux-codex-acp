@@ -341,7 +341,8 @@ mod mcp_server_env_tests {
         assert_eq!(mcp_server_env(None, None), None);
         assert_eq!(mcp_server_env(None, Some(&json!({"cmux": {}}))), None);
         // No name or key that is not a plain identifier, no env that is not an object.
-        let odd = json!({"cmux": {"": "x", "K\"": "x", "K=V": "x", "1K": "x", "K K": "x"}, "a\"b": {"K": "v"}, "c": "x"});
+        let odd =
+            json!({"cmux": {"": "x", "K\"": "x", "K=V": "x", "1K": "x", "K K": "x"}, "a\"b": {"K": "v"}, "c": "x"});
         assert_eq!(mcp_server_env(None, Some(&odd)), None);
         // An HTTP server the session gives under that name keeps its definition too.
         let http = json!([{"name": "cmux", "type": "http", "url": "http://127.0.0.1:1/mcp", "headers": []}]);
